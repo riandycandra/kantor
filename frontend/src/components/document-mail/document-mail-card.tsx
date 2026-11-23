@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckCircle2, FileText, FlaskConical, Save, TriangleAlert } from "lucide-react";
+import { CheckCircle2, FileText, FlaskConical, Loader2, Save, TriangleAlert } from "lucide-react";
 import { useForm, useWatch } from "react-hook-form";
 import { z } from "zod";
 
@@ -17,10 +17,13 @@ import {
   documentMailKeys,
   getDocumentMailSetting,
   sendDocumentMailTest,
+  streamDocumentMailProgress,
   updateDocumentMailSetting,
 } from "@/services/document-mail";
 import { toast } from "@/stores/toast-store";
 import type {
+  DocumentMailProgressEvent,
+  DocumentMailProvider,
   DocumentMailSetting,
   DocumentMailTestResult,
   DocumentPdfStatus,
@@ -31,12 +34,31 @@ const portOptions = [
   { value: "465", label: "465 — SSL/TLS" },
 ] as const;
 
-const emailSchema = z.email();
+const providerOptions: { value: DocumentMailProvider; label: string; description: string }[] = [
+  {
+    value: "gmail",
+    label: "Gmail SMTP",
+    description: "Kirim langsung melalui smtp.gmail.com dengan App Password.",
+  },
+  {
+    value: "smtp_forge",
+    label: "SMTP Forge",
+    description: "Kirim melalui gateway HTTP SMTP Forge dengan X-Mailer-Api-Key.",
+  },
+];
 
-// Changing the Gmail address or port drops the stored app password, so the
-// save needs a new one in the same request ("Hapus password tersimpan" does
-// not replace it). Emptying the address removes the account instead: the
-// stored password is simply dropped and no new one is needed.
+const emailSchema = z.email();
+const uuidSchema = z.uuid();
+
+function isValidHttpUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 function isAccountChange(
   current: DocumentMailSetting | undefined,
   username: string,
@@ -54,10 +76,19 @@ function isAccountRemoval(username: string): boolean {
   return username.trim() === "";
 }
 
+function isForgeUrlChange(current: DocumentMailSetting | undefined, baseUrl: string): boolean {
+  const normalized = baseUrl.trim().replace(/\/+$/, "");
+  if (!current?.has_smtp_forge_api_key || normalized === "") {
+    return false;
+  }
+  return normalized !== (current.smtp_forge_base_url ?? "").trim().replace(/\/+$/, "");
+}
+
 function buildDocumentMailSchema(current: DocumentMailSetting | undefined) {
   return z
     .object({
       enabled: z.boolean(),
+      provider: z.enum(["gmail", "smtp_forge"]),
       smtp_username: z
         .string()
         .trim()
@@ -70,25 +101,71 @@ function buildDocumentMailSchema(current: DocumentMailSetting | undefined) {
       clear_smtp_password: z.boolean(),
       smtp_port: z.enum(["587", "465"]),
       sender_name: z.string().trim().max(120, "Maksimal 120 karakter"),
+      smtp_forge_base_url: z
+        .string()
+        .trim()
+        .max(255, "Maksimal 255 karakter")
+        .refine(
+          (value) => value === "" || isValidHttpUrl(value),
+          "URL harus diawali http:// atau https://",
+        ),
+      smtp_forge_api_key: z.string().max(255, "Maksimal 255 karakter"),
+      clear_smtp_forge_api_key: z.boolean(),
+      smtp_forge_account_id: z
+        .string()
+        .trim()
+        .refine(
+          (value) => value === "" || uuidSchema.safeParse(value).success,
+          "SMTP Account ID harus berupa UUID yang valid",
+        ),
+      smtp_forge_from_email: z
+        .string()
+        .trim()
+        .max(160, "Maksimal 160 karakter")
+        .refine(
+          (value) => value === "" || emailSchema.safeParse(value).success,
+          "Format email tidak valid",
+        ),
     })
     .superRefine((values, ctx) => {
-      if (values.enabled && values.smtp_username === "") {
-        ctx.addIssue({
-          code: "custom",
-          path: ["smtp_username"],
-          message: "Alamat Gmail wajib diisi saat Email Dokumen diaktifkan",
-        });
-      }
-      if (
-        isAccountChange(current, values.smtp_username, values.smtp_port) &&
-        values.smtp_password.trim() === ""
-      ) {
-        ctx.addIssue({
-          code: "custom",
-          path: ["smtp_password"],
-          message:
-            "Alamat Gmail atau port berubah: isi app password baru (password lama tidak dipakai untuk akun lain).",
-        });
+      if (values.provider === "gmail") {
+        if (values.enabled && values.smtp_username === "") {
+          ctx.addIssue({
+            code: "custom",
+            path: ["smtp_username"],
+            message: "Alamat Gmail wajib diisi saat Email Dokumen diaktifkan",
+          });
+        }
+        if (
+          isAccountChange(current, values.smtp_username, values.smtp_port) &&
+          values.smtp_password.trim() === ""
+        ) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["smtp_password"],
+            message:
+              "Alamat Gmail atau port berubah: isi app password baru (password lama tidak dipakai untuk akun lain).",
+          });
+        }
+      } else {
+        if (values.enabled && values.smtp_forge_base_url.trim() === "") {
+          ctx.addIssue({
+            code: "custom",
+            path: ["smtp_forge_base_url"],
+            message: "URL SMTP Forge wajib diisi saat Email Dokumen diaktifkan",
+          });
+        }
+        if (
+          isForgeUrlChange(current, values.smtp_forge_base_url) &&
+          values.smtp_forge_api_key.trim() === ""
+        ) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["smtp_forge_api_key"],
+            message:
+              "URL SMTP Forge berubah: isi API key baru untuk server ini.",
+          });
+        }
       }
     });
 }
@@ -98,16 +175,20 @@ type DocumentMailFormValues = z.infer<ReturnType<typeof buildDocumentMailSchema>
 function toFormValues(setting: DocumentMailSetting | undefined): DocumentMailFormValues {
   return {
     enabled: setting?.enabled ?? false,
+    provider: setting?.provider === "smtp_forge" ? "smtp_forge" : "gmail",
     smtp_username: setting?.smtp_username ?? "",
     smtp_password: "",
     clear_smtp_password: false,
     smtp_port: setting?.smtp_port === 465 ? "465" : "587",
     sender_name: setting?.sender_name ?? "",
+    smtp_forge_base_url: setting?.smtp_forge_base_url ?? "",
+    smtp_forge_api_key: "",
+    clear_smtp_forge_api_key: false,
+    smtp_forge_account_id: setting?.smtp_forge_account_id ?? "",
+    smtp_forge_from_email: setting?.smtp_forge_from_email ?? "",
   };
 }
 
-// Mailpit's web UI runs next to its SMTP port; the link is only shown for a
-// capture server on this machine.
 const mailpitUIURL = "http://localhost:8025";
 
 function isLocalCaptureAddr(addr: string): boolean {
@@ -115,8 +196,6 @@ function isLocalCaptureAddr(addr: string): boolean {
   return host === "localhost" || host === "127.0.0.1" || host === "::1";
 }
 
-// Read-only server status: the LibreOffice binary is chosen by the server
-// environment (auto-detected or SOFFICE_BIN), never from this page.
 function describePdfStatus(pdf: DocumentPdfStatus | undefined): {
   text: string;
   tone: "success" | "warning" | "muted";
@@ -148,13 +227,24 @@ function describePdfStatus(pdf: DocumentPdfStatus | undefined): {
 const inputClass =
   "h-10 rounded-[6px] border-transparent bg-surface-muted px-3 text-[14px] focus:border-ops focus:bg-surface focus:ring-2 focus:ring-ops/20";
 
+type TestResultState =
+  | { kind: "queued"; recipient: string; deliveryId: string; progress?: DocumentMailProgressEvent }
+  | { kind: "sent"; recipient: string }
+  | { kind: "error"; message: string }
+  | null;
+
 export function DocumentMailCard() {
   const queryClient = useQueryClient();
   const { hasPermission } = useRBAC();
   const canManage = hasPermission(permissions.adminSettingsManage);
-  const [testResult, setTestResult] = useState<
-    { kind: "sent"; recipient: string } | { kind: "error"; message: string } | null
-  >(null);
+  const [testResult, setTestResult] = useState<TestResultState>(null);
+  const sseAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    return () => {
+      sseAbortRef.current?.abort();
+    };
+  }, []);
 
   const settingQuery = useQuery({
     queryKey: documentMailKeys.setting(),
@@ -165,11 +255,13 @@ export function DocumentMailCard() {
   const schema = useMemo(() => buildDocumentMailSchema(setting), [setting]);
   const {
     control,
-    formState: { errors, isDirty },
+    formState: { errors },
     handleSubmit,
     register,
     reset,
     setError,
+    setValue,
+    getValues,
   } = useForm<DocumentMailFormValues>({
     resolver: zodResolver(schema),
     defaultValues: toFormValues(undefined),
@@ -182,15 +274,23 @@ export function DocumentMailCard() {
   }, [setting, reset]);
 
   const enabled = useWatch({ control, name: "enabled" });
+  const provider = useWatch({ control, name: "provider" });
   const clearPassword = useWatch({ control, name: "clear_smtp_password" });
   const typedPassword = useWatch({ control, name: "smtp_password" });
   const watchedUsername = useWatch({ control, name: "smtp_username" });
   const watchedPort = useWatch({ control, name: "smtp_port" });
+
+  const watchedForgeUrl = useWatch({ control, name: "smtp_forge_base_url" });
+  const typedForgeKey = useWatch({ control, name: "smtp_forge_api_key" });
+  const clearForgeKey = useWatch({ control, name: "clear_smtp_forge_api_key" });
+
   const accountChanged = isAccountChange(setting, watchedUsername, watchedPort);
   const accountRemoved = isAccountRemoval(watchedUsername);
-  // On an account change the new password replaces the stored one, so the
-  // clear checkbox has no effect and must not lock the password input.
   const clearingPassword = clearPassword && !accountChanged;
+
+  const forgeUrlChanged = isForgeUrlChange(setting, watchedForgeUrl);
+  const forgeUrlEmpty = watchedForgeUrl.trim() === "";
+  const clearingForgeKey = clearForgeKey && !forgeUrlChanged;
 
   const saveMutation = useMutation({
     mutationFn: updateDocumentMailSetting,
@@ -204,10 +304,21 @@ export function DocumentMailCard() {
     onError: (error) => {
       if (error instanceof ApiError && error.code === "SMTP_PASSWORD_REQUIRED") {
         setError("smtp_password", { message: error.message });
+      } else if (error instanceof ApiError && error.code === "SMTP_FORGE_API_KEY_REQUIRED") {
+        setError("smtp_forge_api_key", { message: error.message });
       } else if (error instanceof ApiError && error.code === "VALIDATION_ERROR") {
         const details = (error.details ?? {}) as Record<string, string>;
         if (details.smtp_username) {
           setError("smtp_username", { message: "Alamat Gmail tidak valid atau belum diisi" });
+        }
+        if (details.smtp_forge_base_url) {
+          setError("smtp_forge_base_url", { message: error.message });
+        }
+        if (details.smtp_forge_account_id) {
+          setError("smtp_forge_account_id", { message: error.message });
+        }
+        if (details.smtp_forge_from_email) {
+          setError("smtp_forge_from_email", { message: error.message });
         }
       }
       toast.error(
@@ -219,15 +330,63 @@ export function DocumentMailCard() {
 
   const testMutation = useMutation({
     mutationFn: sendDocumentMailTest,
-    onMutate: () => setTestResult(null),
+    onMutate: () => {
+      sseAbortRef.current?.abort();
+      setTestResult(null);
+    },
     onSuccess: async (result: DocumentMailTestResult) => {
-      if (result.sent) {
-        setTestResult({ kind: "sent", recipient: result.recipient });
-      } else {
+      if (!result.sent) {
         setTestResult({
           kind: "error",
           message: result.error_message ?? "Pengiriman email uji gagal",
         });
+        return;
+      }
+
+      if (result.external_job_id) {
+        setTestResult({
+          kind: "queued",
+          recipient: result.recipient,
+          deliveryId: result.delivery_id,
+          progress: { event: "progress", status: "queued", step: "queued", percentage: 0, message: "Menunggu antrean SMTP Forge..." },
+        });
+        const controller = new AbortController();
+        sseAbortRef.current = controller;
+        try {
+          await streamDocumentMailProgress(
+            `/admin/settings/document-mail/deliveries/${result.delivery_id}/progress`,
+            (ev) => {
+              if (ev.event === "completed") {
+                setTestResult({ kind: "sent", recipient: result.recipient });
+              } else if (ev.event === "failed") {
+                setTestResult({
+                  kind: "error",
+                  message: ev.error || ev.message || "Pengiriman melalui SMTP Forge gagal",
+                });
+              } else {
+                setTestResult({
+                  kind: "queued",
+                  recipient: result.recipient,
+                  deliveryId: result.delivery_id,
+                  progress: ev,
+                });
+              }
+            },
+            controller.signal,
+          );
+        } catch (streamErr) {
+          if (!controller.signal.aborted) {
+            setTestResult({
+              kind: "error",
+              message:
+                streamErr instanceof Error
+                  ? `Email masuk antrean, namun stream progres terputus: ${streamErr.message}`
+                  : "Stream progres SMTP Forge terputus",
+            });
+          }
+        }
+      } else {
+        setTestResult({ kind: "sent", recipient: result.recipient });
       }
     },
     onError: (error) => {
@@ -240,32 +399,89 @@ export function DocumentMailCard() {
 
   const onSubmit = handleSubmit((values) => {
     const password = values.smtp_password.trim();
-    // Emptying the address removes the account: the server drops the stored
-    // password and never keeps one without an address.
     const removal = isAccountRemoval(values.smtp_username);
     const clear =
       (removal && (setting?.has_smtp_password ?? false)) ||
       (values.clear_smtp_password &&
         !isAccountChange(setting, values.smtp_username, values.smtp_port));
+
+    const forgeKey = values.smtp_forge_api_key.trim();
+    const forgeEmpty = values.smtp_forge_base_url.trim() === "";
+    const clearForge =
+      (forgeEmpty && (setting?.has_smtp_forge_api_key ?? false)) ||
+      (values.clear_smtp_forge_api_key &&
+        !isForgeUrlChange(setting, values.smtp_forge_base_url));
+
     saveMutation.mutate({
       enabled: values.enabled,
+      provider: values.provider,
       smtp_username: values.smtp_username.trim().toLowerCase(),
       smtp_password: clear || removal || password === "" ? null : password,
       clear_smtp_password: clear,
       smtp_port: values.smtp_port === "465" ? 465 : 587,
       sender_name: values.sender_name.trim(),
+      smtp_forge_base_url: values.smtp_forge_base_url.trim().replace(/\/+$/, ""),
+      smtp_forge_api_key: clearForge || forgeEmpty || forgeKey === "" ? null : forgeKey,
+      clear_smtp_forge_api_key: clearForge,
+      smtp_forge_account_id: values.smtp_forge_account_id.trim(),
+      smtp_forge_from_email: values.smtp_forge_from_email.trim().toLowerCase(),
     });
   });
 
+  const handleSendTest = () => {
+    const values = getValues();
+    testMutation.mutate({
+      provider: values.provider,
+      smtp_username: values.smtp_username.trim().toLowerCase(),
+      smtp_password: values.smtp_password.trim() === "" ? null : values.smtp_password.trim(),
+      smtp_port: values.smtp_port === "465" ? 465 : 587,
+      sender_name: values.sender_name.trim(),
+      smtp_forge_base_url: values.smtp_forge_base_url.trim().replace(/\/+$/, ""),
+      smtp_forge_api_key:
+        values.smtp_forge_api_key.trim() === "" ? null : values.smtp_forge_api_key.trim(),
+      smtp_forge_account_id: values.smtp_forge_account_id.trim(),
+      smtp_forge_from_email: values.smtp_forge_from_email.trim().toLowerCase(),
+    });
+  };
+
   const hasStoredPassword = setting?.has_smtp_password ?? false;
+  const hasStoredForgeKey = setting?.has_smtp_forge_api_key ?? false;
   const devAddr =
-    setting?.delivery?.mode === "dev_capture"
+    provider === "gmail" && setting?.delivery?.mode === "dev_capture"
       ? (setting.delivery.capture_addr ?? setting.dev_smtp_addr ?? null)
-      : (setting?.dev_smtp_addr ?? null);
+      : provider === "gmail"
+        ? (setting?.dev_smtp_addr ?? null)
+        : null;
   const pdfStatus = describePdfStatus(setting?.pdf);
   const disabled = !canManage || settingQuery.isLoading;
-  // Saved state only, like the other "Status saat ini" lines; pending edits
-  // are described next to the password field.
+
+  const canTestCurrentForm = useMemo(() => {
+    if (provider === "smtp_forge") {
+      const validUrl = isValidHttpUrl(watchedForgeUrl.trim());
+      const hasKey = typedForgeKey.trim() !== "" || (hasStoredForgeKey && !forgeUrlChanged && !clearingForgeKey);
+      return validUrl && hasKey;
+    }
+    const validUser = emailSchema.safeParse(watchedUsername.trim()).success;
+    const hasPass =
+      typedPassword.trim() !== "" ||
+      (hasStoredPassword && !accountChanged && !clearingPassword) ||
+      Boolean(devAddr);
+    return validUser && hasPass;
+  }, [
+    provider,
+    watchedForgeUrl,
+    typedForgeKey,
+    hasStoredForgeKey,
+    forgeUrlChanged,
+    clearingForgeKey,
+    watchedUsername,
+    typedPassword,
+    hasStoredPassword,
+    accountChanged,
+    clearingPassword,
+    devAddr,
+  ]);
+
   const passwordStatus = hasStoredPassword
     ? "Tersimpan"
     : devAddr
@@ -287,6 +503,22 @@ export function DocumentMailCard() {
             ? "App password sudah tersimpan (terenkripsi, tidak pernah ditampilkan). Isi lagi hanya jika ingin mengganti."
             : "App password belum tersimpan untuk tenant ini.";
 
+  const forgeKeyNote = forgeUrlEmpty
+    ? hasStoredForgeKey || typedForgeKey.trim()
+      ? "URL SMTP Forge dikosongkan: API key tidak disimpan dan yang tersimpan akan dihapus saat disimpan."
+      : "API key belum tersimpan untuk tenant ini."
+    : forgeUrlChanged
+      ? "URL SMTP Forge berubah: API key tersimpan akan dihapus, isi API key baru."
+      : clearingForgeKey
+        ? "API key tersimpan akan dihapus saat disimpan."
+        : typedForgeKey.trim()
+          ? hasStoredForgeKey
+            ? "API key baru akan menggantikan yang tersimpan saat disimpan."
+            : "API key baru akan disimpan (terenkripsi) saat disimpan."
+          : hasStoredForgeKey
+            ? "API key sudah tersimpan (terenkripsi, tidak pernah ditampilkan). Isi lagi hanya jika ingin mengganti."
+            : "API key belum tersimpan untuk tenant ini.";
+
   return (
     <Card className="space-y-5 p-6 xl:col-span-2">
       <div className="flex items-start gap-3">
@@ -295,12 +527,11 @@ export function DocumentMailCard() {
         </div>
         <div>
           <h2 className="font-display text-[18px] font-[700] text-text-primary">
-            Email Dokumen (Gmail)
+            Email Dokumen
           </h2>
           <p className="mt-1 text-sm text-text-secondary">
-            Akun Gmail untuk mengirim slip gaji dan kontrak kerja sebagai lampiran PDF. Server SMTP
-            selalu <code>smtp.gmail.com</code>. Reset kata sandi dan notifikasi tetap memakai Email
-            Tenant di atas.
+            Konfigurasi pengiriman slip gaji, kontrak kerja, dan dokumen legal sebagai lampiran PDF.
+            Reset kata sandi dan notifikasi tetap memakai Email Tenant di atas.
           </p>
         </div>
       </div>
@@ -353,122 +584,277 @@ export function DocumentMailCard() {
                   className="h-5 w-5 accent-[var(--module-primary)]"
                   disabled={disabled}
                   type="checkbox"
-                  {...register("enabled", { deps: ["smtp_username"] })}
+                  {...register("enabled", { deps: ["smtp_username", "smtp_forge_base_url"] })}
                 />
               </label>
             </div>
 
-            <div className="grid gap-4 md:grid-cols-2">
-              <Field
-                error={errors.smtp_username?.message}
-                htmlFor="document-mail-username"
-                label="Alamat Gmail"
-                required={enabled}
-              >
-                <Input
-                  autoComplete="off"
-                  className={inputClass}
-                  disabled={disabled}
-                  id="document-mail-username"
-                  placeholder="slip@perusahaan.co.id"
-                  type="email"
-                  {...register("smtp_username", { deps: ["smtp_password"] })}
-                />
-              </Field>
-              <Field error={errors.sender_name?.message} htmlFor="document-mail-sender" label="Nama Pengirim">
-                <Input
-                  className={inputClass}
-                  disabled={disabled}
-                  id="document-mail-sender"
-                  placeholder="HR Perusahaan"
-                  {...register("sender_name")}
-                />
-              </Field>
-              <Field error={errors.smtp_port?.message} htmlFor="document-mail-port" label="Port">
-                <select
-                  className="h-10 w-full rounded-sm border-[1.5px] border-transparent bg-surface-muted px-3 text-[14px] text-text-primary outline-none transition-all focus:border-[#4C9AFF] focus:bg-surface focus:shadow-focus"
-                  disabled={disabled}
-                  id="document-mail-port"
-                  {...register("smtp_port", { deps: ["smtp_password"] })}
-                >
-                  {portOptions.map((option) => (
-                    <option key={option.value} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              </Field>
-              <Field htmlFor="document-mail-host" label="Server SMTP">
-                <Input className={inputClass} disabled id="document-mail-host" value="smtp.gmail.com" readOnly />
-              </Field>
-            </div>
-
-            <Field error={errors.smtp_password?.message} htmlFor="document-mail-password" label="App Password">
-              <Input
-                autoComplete="new-password"
-                className={inputClass}
-                disabled={disabled || clearingPassword}
-                id="document-mail-password"
-                placeholder={
-                  accountChanged
-                    ? "Wajib diisi: app password untuk akun/port baru"
-                    : accountRemoved
-                      ? "Isi alamat Gmail terlebih dahulu"
-                      : hasStoredPassword
-                        ? "Kosongkan untuk mempertahankan app password saat ini"
-                        : "abcd efgh ijkl mnop"
-                }
-                type="password"
-                {...register("smtp_password")}
-              />
-              <div className="flex flex-wrap items-center justify-between gap-3 text-xs text-text-secondary">
-                <span>{passwordNote}</span>
-                <label className="inline-flex items-center gap-2">
-                  <input
-                    className="h-4 w-4 accent-[var(--module-primary)]"
-                    disabled={disabled || !hasStoredPassword || accountChanged}
-                    type="checkbox"
-                    {...register("clear_smtp_password")}
-                  />
-                  Hapus password tersimpan
-                </label>
+            <div className="space-y-2">
+              <p className="text-[13px] font-[600] text-text-primary">Provider Pengiriman</p>
+              <div className="grid gap-3 sm:grid-cols-2">
+                {providerOptions.map((option) => {
+                  const selected = provider === option.value;
+                  return (
+                    <button
+                      className={cn(
+                        "rounded-md border p-3 text-left transition-all",
+                        selected
+                          ? "border-ops bg-ops/5 ring-1 ring-ops"
+                          : "border-border bg-surface hover:bg-surface-muted/60",
+                        disabled && "cursor-not-allowed opacity-60",
+                      )}
+                      disabled={disabled}
+                      key={option.value}
+                      onClick={() => setValue("provider", option.value, { shouldDirty: true })}
+                      type="button"
+                    >
+                      <p className="text-sm font-semibold text-text-primary">{option.label}</p>
+                      <p className="mt-0.5 text-xs text-text-secondary">{option.description}</p>
+                    </button>
+                  );
+                })}
               </div>
-            </Field>
-
-            <div className="rounded-md border border-border bg-surface-muted/40 px-4 py-3 text-sm text-text-secondary">
-              <p className="font-semibold text-text-primary">Sebelum mengisi</p>
-              <ul className="mt-2 list-disc space-y-1 pl-5">
-                <li>Gunakan akun Gmail/Workspace khusus pengirim dokumen, bukan inbox harian seseorang.</li>
-                <li>
-                  Aktifkan Verifikasi 2 Langkah di akun tersebut, lalu buat <em>App Password</em> (16
-                  karakter) dan tempel di sini.
-                </li>
-                <li>
-                  Setiap kali password akun Google diganti, App Password otomatis dicabut. Buat yang baru
-                  dan kirim email uji lagi.
-                </li>
-                <li>
-                  Gmail menyimpan salinan setiap email beserta lampirannya di Sent Mail. Pasang aturan
-                  retensi agar arsip slip gaji dan kontrak tidak menumpuk di sana.
-                </li>
-                <li>
-                  Mengganti alamat Gmail atau port akan menghapus App Password tersimpan. Mengosongkan
-                  alamat Gmail menghapus akun beserta App Password-nya.
-                </li>
-              </ul>
             </div>
+
+            {provider === "gmail" ? (
+              <>
+                <div className="grid gap-4 md:grid-cols-2">
+                  <Field
+                    error={errors.smtp_username?.message}
+                    htmlFor="document-mail-username"
+                    label="Alamat Gmail"
+                    required={enabled}
+                  >
+                    <Input
+                      autoComplete="off"
+                      className={inputClass}
+                      disabled={disabled}
+                      id="document-mail-username"
+                      placeholder="slip@perusahaan.co.id"
+                      type="email"
+                      {...register("smtp_username", { deps: ["smtp_password"] })}
+                    />
+                  </Field>
+                  <Field error={errors.sender_name?.message} htmlFor="document-mail-sender" label="Nama Pengirim">
+                    <Input
+                      className={inputClass}
+                      disabled={disabled}
+                      id="document-mail-sender"
+                      placeholder="HR Perusahaan"
+                      {...register("sender_name")}
+                    />
+                  </Field>
+                  <Field error={errors.smtp_port?.message} htmlFor="document-mail-port" label="Port">
+                    <select
+                      className="h-10 w-full rounded-sm border-[1.5px] border-transparent bg-surface-muted px-3 text-[14px] text-text-primary outline-none transition-all focus:border-[#4C9AFF] focus:bg-surface focus:shadow-focus"
+                      disabled={disabled}
+                      id="document-mail-port"
+                      {...register("smtp_port", { deps: ["smtp_password"] })}
+                    >
+                      {portOptions.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                  <Field htmlFor="document-mail-host" label="Server SMTP">
+                    <Input className={inputClass} disabled id="document-mail-host" value="smtp.gmail.com" readOnly />
+                  </Field>
+                </div>
+
+                <Field error={errors.smtp_password?.message} htmlFor="document-mail-password" label="App Password">
+                  <Input
+                    autoComplete="new-password"
+                    className={inputClass}
+                    disabled={disabled || clearingPassword}
+                    id="document-mail-password"
+                    placeholder={
+                      accountChanged
+                        ? "Wajib diisi: app password untuk akun/port baru"
+                        : accountRemoved
+                          ? "Isi alamat Gmail terlebih dahulu"
+                          : hasStoredPassword
+                            ? "Kosongkan untuk mempertahankan app password saat ini"
+                            : "abcd efgh ijkl mnop"
+                    }
+                    type="password"
+                    {...register("smtp_password")}
+                  />
+                  <div className="flex flex-wrap items-center justify-between gap-3 text-xs text-text-secondary">
+                    <span>{passwordNote}</span>
+                    <label className="inline-flex items-center gap-2">
+                      <input
+                        className="h-4 w-4 accent-[var(--module-primary)]"
+                        disabled={disabled || !hasStoredPassword || accountChanged}
+                        type="checkbox"
+                        {...register("clear_smtp_password")}
+                      />
+                      Hapus password tersimpan
+                    </label>
+                  </div>
+                </Field>
+
+                <div className="rounded-md border border-border bg-surface-muted/40 px-4 py-3 text-sm text-text-secondary">
+                  <p className="font-semibold text-text-primary">Sebelum mengisi (Gmail)</p>
+                  <ul className="mt-2 list-disc space-y-1 pl-5">
+                    <li>Gunakan akun Gmail/Workspace khusus pengirim dokumen, bukan inbox harian seseorang.</li>
+                    <li>
+                      Aktifkan Verifikasi 2 Langkah di akun tersebut, lalu buat <em>App Password</em> (16
+                      karakter) dan tempel di sini.
+                    </li>
+                    <li>
+                      Setiap kali password akun Google diganti, App Password otomatis dicabut. Buat yang baru
+                      dan kirim email uji lagi.
+                    </li>
+                    <li>
+                      Mengganti alamat Gmail atau port akan menghapus App Password tersimpan. Mengosongkan
+                      alamat Gmail menghapus akun beserta App Password-nya.
+                    </li>
+                  </ul>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="grid gap-4 md:grid-cols-2">
+                  <Field
+                    error={errors.smtp_forge_base_url?.message}
+                    htmlFor="document-mail-forge-url"
+                    label="Base URL SMTP Forge"
+                    required={enabled}
+                  >
+                    <Input
+                      autoComplete="off"
+                      className={inputClass}
+                      disabled={disabled}
+                      id="document-mail-forge-url"
+                      placeholder="https://api.smtpforge.com"
+                      type="url"
+                      {...register("smtp_forge_base_url", { deps: ["smtp_forge_api_key"] })}
+                    />
+                  </Field>
+                  <Field error={errors.sender_name?.message} htmlFor="document-mail-sender" label="Nama Pengirim (Opsional)">
+                    <Input
+                      className={inputClass}
+                      disabled={disabled}
+                      id="document-mail-sender"
+                      placeholder="HR Perusahaan"
+                      {...register("sender_name")}
+                    />
+                  </Field>
+                  <Field
+                    error={errors.smtp_forge_account_id?.message}
+                    htmlFor="document-mail-forge-account"
+                    label="SMTP Account ID (Opsional, UUID)"
+                  >
+                    <Input
+                      autoComplete="off"
+                      className={inputClass}
+                      disabled={disabled}
+                      id="document-mail-forge-account"
+                      placeholder="00000000-0000-0000-0000-000000000000"
+                      {...register("smtp_forge_account_id")}
+                    />
+                  </Field>
+                  <Field
+                    error={errors.smtp_forge_from_email?.message}
+                    htmlFor="document-mail-forge-from"
+                    label="From Email (Opsional)"
+                  >
+                    <Input
+                      autoComplete="off"
+                      className={inputClass}
+                      disabled={disabled}
+                      id="document-mail-forge-from"
+                      placeholder="slip@perusahaan.co.id"
+                      type="email"
+                      {...register("smtp_forge_from_email")}
+                    />
+                  </Field>
+                </div>
+
+                <Field
+                  error={errors.smtp_forge_api_key?.message}
+                  htmlFor="document-mail-forge-key"
+                  label="API Key (X-Mailer-Api-Key)"
+                >
+                  <Input
+                    autoComplete="new-password"
+                    className={inputClass}
+                    disabled={disabled || clearingForgeKey}
+                    id="document-mail-forge-key"
+                    placeholder={
+                      forgeUrlChanged
+                        ? "Wajib diisi: API key untuk URL baru"
+                        : forgeUrlEmpty
+                          ? "Isi Base URL terlebih dahulu"
+                          : hasStoredForgeKey
+                            ? "Kosongkan untuk mempertahankan API key saat ini"
+                            : "Tempel API key dari dashboard SMTP Forge"
+                    }
+                    type="password"
+                    {...register("smtp_forge_api_key")}
+                  />
+                  <div className="flex flex-wrap items-center justify-between gap-3 text-xs text-text-secondary">
+                    <span>{forgeKeyNote}</span>
+                    <label className="inline-flex items-center gap-2">
+                      <input
+                        className="h-4 w-4 accent-[var(--module-primary)]"
+                        disabled={disabled || !hasStoredForgeKey || forgeUrlChanged}
+                        type="checkbox"
+                        {...register("clear_smtp_forge_api_key")}
+                      />
+                      Hapus API key tersimpan
+                    </label>
+                  </div>
+                </Field>
+
+                <div className="rounded-md border border-border bg-surface-muted/40 px-4 py-3 text-sm text-text-secondary">
+                  <p className="font-semibold text-text-primary">Sebelum mengisi (SMTP Forge)</p>
+                  <ul className="mt-2 list-disc space-y-1 pl-5">
+                    <li>
+                      Mode <strong>SMTP Forge</strong> otomatis melewati Mailpit lokal walaupun{" "}
+                      <code>APP_ENV=development</code>, sehingga Anda bisa langsung menguji ke server SMTP Forge.
+                    </li>
+                    <li>
+                      <strong>SMTP Account ID</strong> dan <strong>From Email</strong> bersifat opsional; jika
+                      kosong, SMTP Forge otomatis memakai akun SMTP aktif yang terhubung ke API key.
+                    </li>
+                    <li>
+                      Pengiriman dokumen dengan lampiran PDF melalui SMTP Forge menggunakan presigned URL dari{" "}
+                      <code>STORAGE_DRIVER=s3</code>.
+                    </li>
+                  </ul>
+                </div>
+              </>
+            )}
           </div>
 
           <div className="space-y-4 rounded-md border border-border bg-surface-muted/40 p-4">
             <div className="rounded-md border border-border bg-surface px-4 py-3 text-sm">
-              <p className="font-semibold text-text-primary">Status saat ini</p>
+              <p className="font-semibold text-text-primary">Status saat ini (tersimpan)</p>
               <div className="mt-2 space-y-1 text-text-secondary">
                 <p>Email Dokumen aktif: {setting?.enabled ? "Ya" : "Belum"}</p>
-                <p>Alamat Gmail: {setting?.smtp_username || "Belum diisi"}</p>
-                <p>App password: {passwordStatus}</p>
+                <p>Provider: {setting?.provider === "smtp_forge" ? "SMTP Forge" : "Gmail SMTP"}</p>
+                {setting?.provider === "smtp_forge" ? (
+                  <>
+                    <p>Base URL: {setting.smtp_forge_base_url || "Belum diisi"}</p>
+                    <p>API Key: {hasStoredForgeKey ? "Tersimpan" : "Belum ada"}</p>
+                    <p>SMTP Account ID: {setting.smtp_forge_account_id || "Otomatis"}</p>
+                  </>
+                ) : (
+                  <>
+                    <p>Alamat Gmail: {setting?.smtp_username || "Belum diisi"}</p>
+                    <p>App password: {passwordStatus}</p>
+                  </>
+                )}
                 <p>
                   Tujuan pengiriman:{" "}
-                  {devAddr ? `Mailpit lokal (${devAddr})` : "Gmail (smtp.gmail.com)"}
+                  {setting?.provider === "smtp_forge"
+                    ? "SMTP Forge Gateway"
+                    : setting?.delivery?.mode === "dev_capture"
+                      ? `Mailpit lokal (${setting.delivery.capture_addr ?? setting.dev_smtp_addr})`
+                      : "Gmail (smtp.gmail.com)"}
                 </p>
                 {pdfStatus ? (
                   <p data-testid="document-mail-pdf-status">
@@ -500,14 +886,12 @@ export function DocumentMailCard() {
               <div>
                 <p className="text-sm font-semibold text-text-primary">Kirim email uji</p>
                 <p className="mt-1 text-xs text-text-secondary">
-                  Email uji dikirim ke alamat login Anda sendiri memakai pengaturan yang sudah disimpan.
+                  Mengirim ke alamat login Anda memakai nilai formulir saat ini (bisa diuji sebelum disimpan).
                 </p>
               </div>
               <Button
-                disabled={
-                  !canManage || !setting?.ready || isDirty || testMutation.isPending || settingQuery.isLoading
-                }
-                onClick={() => testMutation.mutate()}
+                disabled={!canManage || !canTestCurrentForm || testMutation.isPending || settingQuery.isLoading}
+                onClick={handleSendTest}
                 size="sm"
                 type="button"
                 variant="outline"
@@ -515,21 +899,37 @@ export function DocumentMailCard() {
                 <FlaskConical className="h-4 w-4" />
                 {testMutation.isPending ? "Mengirim..." : "Kirim email uji"}
               </Button>
-              {isDirty && setting?.ready ? (
-                <p className="text-xs text-text-secondary">Simpan perubahan dulu sebelum mengirim email uji.</p>
-              ) : null}
-              {!setting?.ready && !settingQuery.isLoading ? (
+              {!canTestCurrentForm && !settingQuery.isLoading ? (
                 <p className="text-xs text-text-secondary">
-                  Aktifkan dan lengkapi alamat Gmail serta app password, lalu simpan.
+                  {provider === "smtp_forge"
+                    ? "Isi Base URL dan API key SMTP Forge untuk mengirim email uji."
+                    : "Isi alamat Gmail dan app password untuk mengirim email uji."}
                 </p>
               ) : null}
-              {!isDirty && testResult?.kind === "sent" ? (
+              {testResult?.kind === "queued" ? (
+                <div className="space-y-1.5 rounded-md border border-border bg-surface-muted/50 p-3 text-xs" role="status">
+                  <div className="flex items-center justify-between gap-2 font-medium text-text-primary">
+                    <span className="inline-flex items-center gap-1.5">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-ops" />
+                      {testResult.progress?.message || "Mengirim melalui SMTP Forge..."}
+                    </span>
+                    <span>{testResult.progress?.percentage ?? 0}%</span>
+                  </div>
+                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-border">
+                    <div
+                      className="h-full bg-ops transition-all duration-300"
+                      style={{ width: `${Math.min(100, Math.max(5, testResult.progress?.percentage ?? 10))}%` }}
+                    />
+                  </div>
+                </div>
+              ) : null}
+              {testResult?.kind === "sent" ? (
                 <p className="flex items-start gap-2 text-sm text-success" role="status">
                   <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
                   Email uji terkirim ke {testResult.recipient}.
                 </p>
               ) : null}
-              {!isDirty && testResult?.kind === "error" ? (
+              {testResult?.kind === "error" ? (
                 <p className="flex items-start gap-2 text-sm text-error" role="alert">
                   <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
                   {testResult.message}

@@ -43,6 +43,7 @@ type EmailDelivery struct {
 	Error            *string    `json:"error,omitempty"`
 	Attempts         int        `json:"attempts"`
 	BatchID          *string    `json:"batch_id,omitempty"`
+	ExternalJobID    *string    `json:"external_job_id,omitempty"`
 	RequestedBy      *string    `json:"requested_by,omitempty"`
 	CreatedAt        time.Time  `json:"created_at"`
 	UpdatedAt        time.Time  `json:"updated_at"`

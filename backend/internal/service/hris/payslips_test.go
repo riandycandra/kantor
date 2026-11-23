@@ -3,6 +3,7 @@ package hris
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -435,6 +436,9 @@ type fakeMailSender struct {
 func (f *fakeMailSender) Ready(context.Context) (bool, error) { return true, nil }
 func (f *fakeMailSender) GetSettings(context.Context) (dto.DocumentMailSettingResponse, error) {
 	return dto.DocumentMailSettingResponse{SenderName: "HR Kantor", Enabled: true}, nil
+}
+func (f *fakeMailSender) StreamDeliveryProgress(context.Context, string, http.ResponseWriter, http.Flusher) error {
+	return nil
 }
 func (f *fakeMailSender) Deliver(_ context.Context, req authservice.DocumentMailRequest) (model.EmailDelivery, error) {
 	f.mu.Lock()

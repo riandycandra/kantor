@@ -137,16 +137,23 @@ export interface AdminSettings {
   reimbursement_reminder: ReimbursementReminderSetting;
 }
 
-/** Documents-only Gmail settings (payslips, contracts). Never carries the app password. */
+export type DocumentMailProvider = "gmail" | "smtp_forge";
+
+/** Documents-only mail settings (payslips, contracts). Never carries secrets. */
 export interface DocumentMailSetting {
   enabled: boolean;
+  provider: DocumentMailProvider;
   smtp_host: string;
   smtp_username: string;
   smtp_port: 587 | 465;
   sender_name: string;
   has_smtp_password: boolean;
+  smtp_forge_base_url: string;
+  has_smtp_forge_api_key: boolean;
+  smtp_forge_account_id: string;
+  smtp_forge_from_email: string;
   ready: boolean;
-  /** Present only while development mail capture (Mailpit) is active. */
+  /** Present only while development mail capture (Mailpit) is active for Gmail. */
   dev_smtp_addr?: string | null;
   /** Read-only: where document email actually goes (set by the server environment). */
   delivery?: DocumentMailDeliveryStatus;
@@ -155,7 +162,7 @@ export interface DocumentMailSetting {
 }
 
 export interface DocumentMailDeliveryStatus {
-  mode: "gmail" | "dev_capture";
+  mode: "gmail" | "smtp_forge" | "dev_capture";
   capture_addr?: string | null;
 }
 
@@ -169,11 +176,39 @@ export interface DocumentPdfStatus {
 
 export interface UpdateDocumentMailPayload {
   enabled: boolean;
+  provider: DocumentMailProvider;
   smtp_username: string;
   smtp_password: string | null;
   clear_smtp_password: boolean;
   smtp_port: 587 | 465;
   sender_name: string;
+  smtp_forge_base_url: string;
+  smtp_forge_api_key: string | null;
+  clear_smtp_forge_api_key: boolean;
+  smtp_forge_account_id: string;
+  smtp_forge_from_email: string;
+}
+
+export interface TestDocumentMailPayload {
+  provider: DocumentMailProvider;
+  smtp_username?: string;
+  smtp_password?: string | null;
+  smtp_port?: 587 | 465;
+  sender_name?: string;
+  smtp_forge_base_url?: string;
+  smtp_forge_api_key?: string | null;
+  smtp_forge_account_id?: string;
+  smtp_forge_from_email?: string;
+}
+
+export interface DocumentMailProgressEvent {
+  event: "progress" | "completed" | "failed";
+  job_id?: string;
+  status?: string;
+  step?: string;
+  percentage?: number;
+  message?: string;
+  error?: string | null;
 }
 
 export type DocumentMailErrorCategory =
@@ -190,6 +225,7 @@ export type DocumentMailErrorCategory =
 export interface DocumentMailTestResult {
   sent: boolean;
   delivery_id: string;
+  external_job_id?: string | null;
   recipient: string;
   error_category?: DocumentMailErrorCategory | null;
   error_message?: string | null;

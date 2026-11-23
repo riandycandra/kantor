@@ -82,42 +82,60 @@ type UpdateReimbursementReminderRequest struct {
 	Payment ReimbursementReminderRuleRequest `json:"payment"`
 }
 
-// UpdateDocumentMailRequest edits the documents-only Gmail settings. The host
-// is fixed (smtp.gmail.com); only the account, app password, port and display
-// name are configurable. Changing smtp_username or smtp_port while an app
-// password is stored requires a new smtp_password in the same request;
-// clear_smtp_password alone does not satisfy that rule. A blank smtp_username
-// removes the account and drops the stored password.
+// UpdateDocumentMailRequest edits the documents-only mail settings (Gmail SMTP
+// or SMTP Forge). Secrets are encrypted at rest and never returned.
 type UpdateDocumentMailRequest struct {
-	Enabled           bool    `json:"enabled"`
-	SMTPUsername      string  `json:"smtp_username" validate:"omitempty,email,max=160"`
-	SMTPPassword      *string `json:"smtp_password" validate:"omitempty,max=200"`
-	ClearSMTPPassword bool    `json:"clear_smtp_password"`
-	SMTPPort          int     `json:"smtp_port" validate:"required,oneof=587 465"`
-	SenderName        string  `json:"sender_name" validate:"omitempty,max=120"`
+	Enabled              bool    `json:"enabled"`
+	Provider             string  `json:"provider" validate:"omitempty,oneof=gmail smtp_forge"`
+	SMTPUsername         string  `json:"smtp_username" validate:"omitempty,email,max=160"`
+	SMTPPassword         *string `json:"smtp_password" validate:"omitempty,max=200"`
+	ClearSMTPPassword    bool    `json:"clear_smtp_password"`
+	SMTPPort             int     `json:"smtp_port" validate:"omitempty,oneof=587 465"`
+	SenderName           string  `json:"sender_name" validate:"omitempty,max=120"`
+	SMTPForgeBaseURL     string  `json:"smtp_forge_base_url" validate:"omitempty,url,max=255"`
+	SMTPForgeAPIKey      *string `json:"smtp_forge_api_key" validate:"omitempty,max=255"`
+	ClearSMTPForgeAPIKey bool    `json:"clear_smtp_forge_api_key"`
+	SMTPForgeAccountID   string  `json:"smtp_forge_account_id" validate:"omitempty,uuid4"`
+	SMTPForgeFromEmail   string  `json:"smtp_forge_from_email" validate:"omitempty,email,max=160"`
 }
 
-// DocumentMailSettingResponse never carries the app password, only whether
-// one is stored. DevSMTPAddr is present only while development mail capture
-// (APP_ENV=development, Mailpit by default) is active. Delivery and PDF are
-// read-only server status derived from the environment; the update request
-// has no such fields.
+// TestDocumentMailRequest optionally carries unsaved form values so admins can
+// test Gmail or SMTP Forge settings before saving them.
+type TestDocumentMailRequest struct {
+	Provider           string  `json:"provider" validate:"omitempty,oneof=gmail smtp_forge"`
+	SMTPUsername       string  `json:"smtp_username" validate:"omitempty,email,max=160"`
+	SMTPPassword       *string `json:"smtp_password" validate:"omitempty,max=200"`
+	SMTPPort           int     `json:"smtp_port" validate:"omitempty,oneof=587 465"`
+	SenderName         string  `json:"sender_name" validate:"omitempty,max=120"`
+	SMTPForgeBaseURL   string  `json:"smtp_forge_base_url" validate:"omitempty,url,max=255"`
+	SMTPForgeAPIKey    *string `json:"smtp_forge_api_key" validate:"omitempty,max=255"`
+	SMTPForgeAccountID string  `json:"smtp_forge_account_id" validate:"omitempty,uuid4"`
+	SMTPForgeFromEmail string  `json:"smtp_forge_from_email" validate:"omitempty,email,max=160"`
+}
+
+// DocumentMailSettingResponse never carries secrets, only whether they are
+// stored. DevSMTPAddr is present only while development mail capture
+// (APP_ENV=development, Mailpit by default) is active for Gmail.
 type DocumentMailSettingResponse struct {
-	Enabled         bool                       `json:"enabled"`
-	SMTPHost        string                     `json:"smtp_host"`
-	SMTPUsername    string                     `json:"smtp_username"`
-	SMTPPort        int                        `json:"smtp_port"`
-	SenderName      string                     `json:"sender_name"`
-	HasSMTPPassword bool                       `json:"has_smtp_password"`
-	Ready           bool                       `json:"ready"`
-	DevSMTPAddr     *string                    `json:"dev_smtp_addr,omitempty"`
-	Delivery        DocumentMailDeliveryStatus `json:"delivery"`
-	PDF             DocumentPDFStatus          `json:"pdf"`
+	Enabled            bool                       `json:"enabled"`
+	Provider           string                     `json:"provider"`
+	SMTPHost           string                     `json:"smtp_host"`
+	SMTPUsername       string                     `json:"smtp_username"`
+	SMTPPort           int                        `json:"smtp_port"`
+	SenderName         string                     `json:"sender_name"`
+	HasSMTPPassword    bool                       `json:"has_smtp_password"`
+	SMTPForgeBaseURL   string                     `json:"smtp_forge_base_url"`
+	HasSMTPForgeAPIKey bool                       `json:"has_smtp_forge_api_key"`
+	SMTPForgeAccountID string                     `json:"smtp_forge_account_id"`
+	SMTPForgeFromEmail string                     `json:"smtp_forge_from_email"`
+	Ready              bool                       `json:"ready"`
+	DevSMTPAddr        *string                    `json:"dev_smtp_addr,omitempty"`
+	Delivery           DocumentMailDeliveryStatus `json:"delivery"`
+	PDF                DocumentPDFStatus          `json:"pdf"`
 }
 
 // DocumentMailDeliveryStatus says where document email actually goes:
-// "gmail" (smtp.gmail.com) or "dev_capture" (a local capture server such as
-// Mailpit, only with APP_ENV=development).
+// "gmail", "smtp_forge", or "dev_capture".
 type DocumentMailDeliveryStatus struct {
 	Mode        string  `json:"mode"`
 	CaptureAddr *string `json:"capture_addr,omitempty"`
@@ -136,6 +154,7 @@ type DocumentPDFStatus struct {
 type DocumentMailTestResponse struct {
 	Sent          bool    `json:"sent"`
 	DeliveryID    string  `json:"delivery_id"`
+	ExternalJobID *string `json:"external_job_id,omitempty"`
 	Recipient     string  `json:"recipient"`
 	ErrorCategory *string `json:"error_category,omitempty"`
 	ErrorMessage  *string `json:"error_message,omitempty"`

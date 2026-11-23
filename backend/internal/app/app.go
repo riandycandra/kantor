@@ -280,6 +280,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		mail.NewGmailSender(documentMailCaptureAddr(ctx, cfg)),
 		encrypter,
 	)
+	documentMailService.SetStorage(storageProvider)
 	documentMailService.SetPDFStatus(cfg.Documents.PDFEnabled(), cfg.Documents.SofficeSource)
 
 	trackerReminderService := operationalservice.NewTrackerReminderService(trackerReminderRepository, notificationsRepository, whatsappService)
@@ -582,6 +583,7 @@ func (a *App) buildRouter(
 						platformmiddleware.RequirePermission("admin:settings:manage"),
 						platformmiddleware.NewUserRateLimit(5, time.Minute, "RATE_LIMITED", "Terlalu banyak email uji. Coba lagi sebentar."),
 					).Post("/settings/document-mail/test", authHandler.SendDocumentMailTest)
+					admin.With(platformmiddleware.RequirePermission("admin:settings:manage")).Get("/settings/document-mail/deliveries/{deliveryID}/progress", authHandler.StreamDocumentMailProgress)
 					admin.With(platformmiddleware.RequirePermission("admin:settings:view")).Get("/settings/company-profile", authHandler.GetCompanyProfile)
 					admin.With(platformmiddleware.RequirePermission("admin:settings:manage")).Put("/settings/company-profile", authHandler.UpdateCompanyProfile)
 					admin.With(platformmiddleware.RequirePermission("admin:settings:view")).Get("/settings/company-profile/logo", authHandler.GetCompanyLogo)

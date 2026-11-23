@@ -50,7 +50,7 @@ func NewEmailDeliveriesRepository(db repository.DBTX) *EmailDeliveriesRepository
 const emailDeliveryColumns = `
 	id::text, kind, reference_type, reference_id::text, recipient, recipient_source,
 	cc, subject, attachment_names, attachment_sha256, status, error, attempts,
-	batch_id::text, requested_by::text, created_at, updated_at, sent_at
+	batch_id::text, external_job_id, requested_by::text, created_at, updated_at, sent_at
 `
 
 func (r *EmailDeliveriesRepository) Create(ctx context.Context, params CreateEmailDeliveryParams) (model.EmailDelivery, error) {
@@ -115,6 +115,22 @@ func (r *EmailDeliveriesRepository) MarkSending(ctx context.Context, id string) 
 	}
 	if err != nil && isInFlightViolation(err) {
 		return model.EmailDelivery{}, ErrEmailDeliveryInFlight
+	}
+	return item, err
+}
+
+func (r *EmailDeliveriesRepository) SetExternalJobID(ctx context.Context, id string, externalJobID string) (model.EmailDelivery, error) {
+	ctx, cancel := repository.QueryContext(ctx)
+	defer cancel()
+
+	row := repository.DB(ctx, r.db).QueryRow(ctx, `
+		UPDATE email_deliveries
+		SET external_job_id = NULLIF($2, ''), updated_at = NOW()
+		WHERE id = $1::uuid
+		RETURNING `+emailDeliveryColumns, id, strings.TrimSpace(externalJobID))
+	item, err := scanEmailDelivery(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return model.EmailDelivery{}, ErrEmailDeliveryNotFound
 	}
 	return item, err
 }
@@ -304,6 +320,7 @@ func scanEmailDelivery(row pgx.Row) (model.EmailDelivery, error) {
 		&item.Error,
 		&item.Attempts,
 		&item.BatchID,
+		&item.ExternalJobID,
 		&item.RequestedBy,
 		&item.CreatedAt,
 		&item.UpdatedAt,

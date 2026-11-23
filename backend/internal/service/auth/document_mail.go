@@ -1,21 +1,31 @@
 package auth
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/kana-consultant/kantor/backend/internal/dto"
 	"github.com/kana-consultant/kantor/backend/internal/mail"
+	platformmiddleware "github.com/kana-consultant/kantor/backend/internal/middleware"
 	"github.com/kana-consultant/kantor/backend/internal/model"
 	authrepo "github.com/kana-consultant/kantor/backend/internal/repository/auth"
 	notificationsrepo "github.com/kana-consultant/kantor/backend/internal/repository/notifications"
 	"github.com/kana-consultant/kantor/backend/internal/security"
+	"github.com/kana-consultant/kantor/backend/internal/storage"
 )
 
 const (
@@ -40,12 +50,18 @@ const (
 )
 
 var (
-	ErrDocumentMailNotReady         = errors.New("Email Dokumen belum aktif atau belum lengkap. Aktifkan dan isi alamat Gmail serta app password di Admin > Settings.")
-	ErrDocumentMailUsernameRequired = errors.New("alamat Gmail wajib diisi saat Email Dokumen diaktifkan")
-	ErrDocumentMailUsernameInvalid  = errors.New("alamat Gmail tidak valid: isi satu alamat email biasa, misalnya slip@perusahaan.co.id")
-	ErrDocumentMailPasswordRequired = errors.New("alamat Gmail atau port berubah: isi app password baru untuk akun tersebut")
-	ErrDocumentMailInFlight         = errors.New("pengiriman untuk dokumen ini masih berjalan")
-	ErrDocumentMailInvalidRequest   = errors.New("permintaan pengiriman email dokumen tidak valid")
+	ErrDocumentMailNotReady               = errors.New("Email Dokumen belum aktif atau belum lengkap. Aktifkan dan lengkapi pengaturan di Admin > Settings.")
+	ErrDocumentMailUsernameRequired       = errors.New("alamat Gmail wajib diisi saat Email Dokumen diaktifkan")
+	ErrDocumentMailUsernameInvalid        = errors.New("alamat Gmail tidak valid: isi satu alamat email biasa, misalnya slip@perusahaan.co.id")
+	ErrDocumentMailPasswordRequired       = errors.New("alamat Gmail atau port berubah: isi app password baru untuk akun tersebut")
+	ErrDocumentMailForgeURLRequired       = errors.New("URL SMTP Forge wajib diisi saat Email Dokumen diaktifkan")
+	ErrDocumentMailForgeURLInvalid        = errors.New("URL SMTP Forge tidak valid (gunakan http:// atau https://)")
+	ErrDocumentMailForgeAPIKeyRequired    = errors.New("URL SMTP Forge berubah: isi API key baru untuk server tersebut")
+	ErrDocumentMailForgeAccountInvalid    = errors.New("SMTP Account ID harus berupa UUID yang valid")
+	ErrDocumentMailForgeFromEmailInvalid  = errors.New("email pengirim SMTP Forge tidak valid")
+	ErrDocumentMailDeliveryNotFound       = errors.New("riwayat pengiriman email tidak ditemukan")
+	ErrDocumentMailInFlight               = errors.New("pengiriman untuk dokumen ini masih berjalan")
+	ErrDocumentMailInvalidRequest         = errors.New("permintaan pengiriman email dokumen tidak valid")
 )
 
 type documentMailSettingsRepository interface {
@@ -60,6 +76,7 @@ type documentMailDeliveriesRepository interface {
 	Create(ctx context.Context, params notificationsrepo.CreateEmailDeliveryParams) (model.EmailDelivery, error)
 	GetByID(ctx context.Context, id string) (model.EmailDelivery, error)
 	MarkSending(ctx context.Context, id string) (model.EmailDelivery, error)
+	SetExternalJobID(ctx context.Context, id string, externalJobID string) (model.EmailDelivery, error)
 	MarkSent(ctx context.Context, id string, sentAt time.Time) (model.EmailDelivery, error)
 	MarkFailed(ctx context.Context, id string, message string) (model.EmailDelivery, error)
 	FailStaleInFlight(ctx context.Context, referenceType string, referenceID string, olderThan time.Duration, message string) (int64, error)
@@ -76,17 +93,31 @@ type DocumentMailTransport interface {
 	DevSMTPAddr() string
 }
 
+type presignStorage interface {
+	storage.Storage
+	PresignGet(ctx context.Context, key string, expiry time.Duration) (string, error)
+}
+
+type forgeTestSession struct {
+	baseURL string
+	apiKey  string
+	jobID   string
+}
+
 // DocumentMailService owns the tenant's 'document_mail' setting and is the
 // single entry point for sending document email. Payslip and contract
 // senders call Deliver (or Enqueue + Deliver with DeliveryID for batches);
 // every attempt is recorded in email_deliveries.
 type DocumentMailService struct {
-	repo       documentMailSettingsRepository
-	deliveries documentMailDeliveriesRepository
-	notifier   documentMailNotifier
-	transport  DocumentMailTransport
-	encrypter  *security.Encrypter
-	now        func() time.Time
+	repo          documentMailSettingsRepository
+	deliveries    documentMailDeliveriesRepository
+	notifier      documentMailNotifier
+	transport     DocumentMailTransport
+	forge         *mail.SMTPForgeSender
+	storage       storage.Storage
+	encrypter     *security.Encrypter
+	now           func() time.Time
+	forgeSessions sync.Map
 	// pdf is the read-only PDF conversion status shown next to the
 	// settings (SetPDFStatus); it never holds a filesystem path.
 	pdf dto.DocumentPDFStatus
@@ -95,6 +126,7 @@ type DocumentMailService struct {
 // Document mail delivery modes reported in DocumentMailSettingResponse.
 const (
 	DocumentMailModeGmail      = "gmail"
+	DocumentMailModeSMTPForge  = "smtp_forge"
 	DocumentMailModeDevCapture = "dev_capture"
 )
 
@@ -134,10 +166,22 @@ func NewDocumentMailService(
 		deliveries: deliveries,
 		notifier:   notifier,
 		transport:  transport,
+		forge:      mail.NewSMTPForgeSender(nil),
 		encrypter:  encrypter,
 		now:        time.Now,
 		pdf:        dto.DocumentPDFStatus{Enabled: false, Source: "not_found"},
 	}
+}
+
+// SetStorage attaches the storage provider used for temporary presigned S3
+// attachment URLs when sending via SMTP Forge.
+func (s *DocumentMailService) SetStorage(store storage.Storage) {
+	s.storage = store
+}
+
+// SetForgeSender overrides the SMTP Forge HTTP sender (used in unit tests).
+func (s *DocumentMailService) SetForgeSender(forge *mail.SMTPForgeSender) {
+	s.forge = forge
 }
 
 // SetPDFStatus records whether the document engine converts to PDF and how
@@ -154,33 +198,71 @@ func (s *DocumentMailService) devSMTPAddr() string {
 	return s.transport.DevSMTPAddr()
 }
 
-func (s *DocumentMailService) toResponse(setting authrepo.DocumentMailSettingRecord) dto.DocumentMailSettingResponse {
-	response := dto.DocumentMailSettingResponse{
-		Enabled:         setting.Enabled,
-		SMTPHost:        mail.GmailHost,
-		SMTPUsername:    setting.SMTPUsername,
-		SMTPPort:        setting.SMTPPort,
-		SenderName:      setting.SenderName,
-		HasSMTPPassword: setting.HasPassword(),
-		Ready:           s.isReady(setting),
+// effectiveDevSMTPAddr returns the local Mailpit capture address only when
+// Gmail is the active provider. Selecting smtp_forge bypasses Mailpit
+// automatically so admins can test/send directly through SMTP Forge.
+func (s *DocumentMailService) effectiveDevSMTPAddr(setting authrepo.DocumentMailSettingRecord) string {
+	if setting.Provider == authrepo.DocumentMailProviderSMTPForge {
+		return ""
 	}
-	response.Delivery = dto.DocumentMailDeliveryStatus{Mode: DocumentMailModeGmail}
-	if addr := s.devSMTPAddr(); addr != "" {
-		devAddr, captureAddr := addr, addr
-		response.DevSMTPAddr = &devAddr
-		response.Delivery = dto.DocumentMailDeliveryStatus{Mode: DocumentMailModeDevCapture, CaptureAddr: &captureAddr}
+	return s.devSMTPAddr()
+}
+
+func (s *DocumentMailService) toResponse(setting authrepo.DocumentMailSettingRecord) dto.DocumentMailSettingResponse {
+	normalized := authrepo.NormalizeDocumentMailSettingRecord(setting)
+	response := dto.DocumentMailSettingResponse{
+		Enabled:            normalized.Enabled,
+		Provider:           normalized.Provider,
+		SMTPHost:           mail.GmailHost,
+		SMTPUsername:       normalized.SMTPUsername,
+		SMTPPort:           normalized.SMTPPort,
+		SenderName:         normalized.SenderName,
+		HasSMTPPassword:    normalized.HasPassword(),
+		SMTPForgeBaseURL:   normalized.SMTPForgeBaseURL,
+		HasSMTPForgeAPIKey: normalized.HasSMTPForgeAPIKey(),
+		SMTPForgeAccountID: normalized.SMTPForgeAccountID,
+		SMTPForgeFromEmail: normalized.SMTPForgeFromEmail,
+		Ready:              s.isReady(normalized),
+	}
+	if normalized.Provider == authrepo.DocumentMailProviderSMTPForge {
+		response.Delivery = dto.DocumentMailDeliveryStatus{Mode: DocumentMailModeSMTPForge}
+	} else {
+		response.Delivery = dto.DocumentMailDeliveryStatus{Mode: DocumentMailModeGmail}
+		if addr := s.effectiveDevSMTPAddr(normalized); addr != "" {
+			devAddr, captureAddr := addr, addr
+			response.DevSMTPAddr = &devAddr
+			response.Delivery = dto.DocumentMailDeliveryStatus{Mode: DocumentMailModeDevCapture, CaptureAddr: &captureAddr}
+		}
 	}
 	response.PDF = s.pdf
 	return response
 }
 
-// isReady: enabled with a username, and an app password — which may only be
-// missing while the development SMTP override is active.
 func (s *DocumentMailService) isReady(setting authrepo.DocumentMailSettingRecord) bool {
-	return setting.Enabled &&
-		setting.SMTPUsername != "" &&
-		mail.ValidateAddress(setting.SMTPUsername) == nil &&
-		(setting.HasPassword() || s.devSMTPAddr() != "")
+	normalized := authrepo.NormalizeDocumentMailSettingRecord(setting)
+	if !normalized.Enabled {
+		return false
+	}
+	if normalized.Provider == authrepo.DocumentMailProviderSMTPForge {
+		if normalized.SMTPForgeBaseURL == "" || !normalized.HasSMTPForgeAPIKey() {
+			return false
+		}
+		if _, err := mail.NormalizeSMTPForgeAPIBase(normalized.SMTPForgeBaseURL); err != nil {
+			return false
+		}
+		if normalized.SMTPForgeFromEmail != "" && mail.ValidateAddress(normalized.SMTPForgeFromEmail) != nil {
+			return false
+		}
+		if normalized.SMTPForgeAccountID != "" {
+			if _, err := uuid.Parse(normalized.SMTPForgeAccountID); err != nil {
+				return false
+			}
+		}
+		return true
+	}
+	return normalized.SMTPUsername != "" &&
+		mail.ValidateAddress(normalized.SMTPUsername) == nil &&
+		(normalized.HasPassword() || s.effectiveDevSMTPAddr(normalized) != "")
 }
 
 // GetSettings returns the public view (has_smtp_password only).
@@ -216,56 +298,115 @@ func (s *DocumentMailService) UpdateSettings(ctx context.Context, actorID string
 
 	updated := existing
 	updated.Enabled = input.Enabled
-	updated.SMTPUsername = strings.ToLower(strings.TrimSpace(input.SMTPUsername))
-	updated.SMTPPort = input.SMTPPort
+	if strings.TrimSpace(input.Provider) != "" {
+		updated.Provider = strings.ToLower(strings.TrimSpace(input.Provider))
+	}
+	if updated.Provider != authrepo.DocumentMailProviderSMTPForge {
+		updated.Provider = authrepo.DocumentMailProviderGmail
+	}
 	updated.SenderName = sanitizeSenderName(input.SenderName)
 
-	if updated.Enabled && updated.SMTPUsername == "" {
-		return dto.DocumentMailSettingResponse{}, nil, ErrDocumentMailUsernameRequired
-	}
-	// The DTO's email tag accepts RFC quoted local parts ("a b"@x) that the
-	// sender refuses; store only what can actually be sent from.
-	if updated.SMTPUsername != "" && mail.ValidateAddress(updated.SMTPUsername) != nil {
-		return dto.DocumentMailSettingResponse{}, nil, ErrDocumentMailUsernameInvalid
-	}
-
-	newPassword := ""
-	if input.SMTPPassword != nil {
-		// App passwords are shown by Google as "abcd efgh ijkl mnop"; the
-		// spaces are not part of the secret.
-		newPassword = strings.Join(strings.Fields(*input.SMTPPassword), "")
-	}
-
-	clearPassword := input.ClearSMTPPassword
-	accountChanged := updated.SMTPUsername != existing.SMTPUsername || updated.SMTPPort != existing.SMTPPort
-	switch {
-	case updated.SMTPUsername == "":
-		// No account: an app password (stored or new) has nothing to belong
-		// to, so it is never kept.
-		clearPassword = true
-		newPassword = ""
-	case accountChanged && existing.HasPassword():
-		if newPassword == "" {
-			return dto.DocumentMailSettingResponse{}, nil, ErrDocumentMailPasswordRequired
+	if updated.Provider == authrepo.DocumentMailProviderGmail {
+		updated.SMTPUsername = strings.ToLower(strings.TrimSpace(input.SMTPUsername))
+		if input.SMTPPort == 587 || input.SMTPPort == 465 {
+			updated.SMTPPort = input.SMTPPort
+		} else if updated.SMTPPort != 587 && updated.SMTPPort != 465 {
+			updated.SMTPPort = authrepo.DefaultDocumentMailPort
 		}
-		// Never reuse a stored app password for a different account or port.
-		// The new password replaces it, so an explicit clear is redundant.
-		updated.SMTPPasswordEncrypted = ""
-		clearPassword = false
-	}
 
-	switch {
-	case clearPassword:
-		updated.SMTPPasswordEncrypted = ""
-	case newPassword != "":
-		if s.encrypter == nil {
-			return dto.DocumentMailSettingResponse{}, nil, errors.New("document mail encrypter is not configured")
+		if updated.Enabled && updated.SMTPUsername == "" {
+			return dto.DocumentMailSettingResponse{}, nil, ErrDocumentMailUsernameRequired
 		}
-		ciphertext, err := s.encrypter.EncryptString(newPassword)
-		if err != nil {
-			return dto.DocumentMailSettingResponse{}, nil, err
+		if updated.SMTPUsername != "" && mail.ValidateAddress(updated.SMTPUsername) != nil {
+			return dto.DocumentMailSettingResponse{}, nil, ErrDocumentMailUsernameInvalid
 		}
-		updated.SMTPPasswordEncrypted = ciphertext
+
+		newPassword := ""
+		if input.SMTPPassword != nil {
+			newPassword = strings.Join(strings.Fields(*input.SMTPPassword), "")
+		}
+
+		clearPassword := input.ClearSMTPPassword
+		accountChanged := updated.SMTPUsername != existing.SMTPUsername || updated.SMTPPort != existing.SMTPPort
+		switch {
+		case updated.SMTPUsername == "":
+			clearPassword = true
+			newPassword = ""
+		case accountChanged && existing.HasPassword():
+			if newPassword == "" {
+				return dto.DocumentMailSettingResponse{}, nil, ErrDocumentMailPasswordRequired
+			}
+			updated.SMTPPasswordEncrypted = ""
+			clearPassword = false
+		}
+
+		switch {
+		case clearPassword:
+			updated.SMTPPasswordEncrypted = ""
+		case newPassword != "":
+			if s.encrypter == nil {
+				return dto.DocumentMailSettingResponse{}, nil, errors.New("document mail encrypter is not configured")
+			}
+			ciphertext, err := s.encrypter.EncryptString(newPassword)
+			if err != nil {
+				return dto.DocumentMailSettingResponse{}, nil, err
+			}
+			updated.SMTPPasswordEncrypted = ciphertext
+		}
+	} else {
+		updated.SMTPForgeBaseURL = strings.TrimRight(strings.TrimSpace(input.SMTPForgeBaseURL), "/")
+		updated.SMTPForgeAccountID = strings.TrimSpace(input.SMTPForgeAccountID)
+		updated.SMTPForgeFromEmail = strings.ToLower(strings.TrimSpace(input.SMTPForgeFromEmail))
+
+		if updated.Enabled && updated.SMTPForgeBaseURL == "" {
+			return dto.DocumentMailSettingResponse{}, nil, ErrDocumentMailForgeURLRequired
+		}
+		if updated.SMTPForgeBaseURL != "" {
+			if _, err := mail.NormalizeSMTPForgeAPIBase(updated.SMTPForgeBaseURL); err != nil {
+				return dto.DocumentMailSettingResponse{}, nil, ErrDocumentMailForgeURLInvalid
+			}
+		}
+		if updated.SMTPForgeAccountID != "" {
+			if _, err := uuid.Parse(updated.SMTPForgeAccountID); err != nil {
+				return dto.DocumentMailSettingResponse{}, nil, ErrDocumentMailForgeAccountInvalid
+			}
+		}
+		if updated.SMTPForgeFromEmail != "" && mail.ValidateAddress(updated.SMTPForgeFromEmail) != nil {
+			return dto.DocumentMailSettingResponse{}, nil, ErrDocumentMailForgeFromEmailInvalid
+		}
+
+		newAPIKey := ""
+		if input.SMTPForgeAPIKey != nil {
+			newAPIKey = strings.TrimSpace(*input.SMTPForgeAPIKey)
+		}
+
+		clearAPIKey := input.ClearSMTPForgeAPIKey
+		urlChanged := updated.SMTPForgeBaseURL != existing.SMTPForgeBaseURL
+		switch {
+		case updated.SMTPForgeBaseURL == "":
+			clearAPIKey = true
+			newAPIKey = ""
+		case urlChanged && existing.HasSMTPForgeAPIKey():
+			if newAPIKey == "" {
+				return dto.DocumentMailSettingResponse{}, nil, ErrDocumentMailForgeAPIKeyRequired
+			}
+			updated.SMTPForgeAPIKeyEncrypted = ""
+			clearAPIKey = false
+		}
+
+		switch {
+		case clearAPIKey:
+			updated.SMTPForgeAPIKeyEncrypted = ""
+		case newAPIKey != "":
+			if s.encrypter == nil {
+				return dto.DocumentMailSettingResponse{}, nil, errors.New("document mail encrypter is not configured")
+			}
+			ciphertext, err := s.encrypter.EncryptString(newAPIKey)
+			if err != nil {
+				return dto.DocumentMailSettingResponse{}, nil, err
+			}
+			updated.SMTPForgeAPIKeyEncrypted = ciphertext
+		}
 	}
 
 	updated = authrepo.NormalizeDocumentMailSettingRecord(updated)
@@ -283,9 +424,12 @@ func (s *DocumentMailService) UpdateSettings(ctx context.Context, actorID string
 }
 
 func documentMailChangedFields(before authrepo.DocumentMailSettingRecord, after authrepo.DocumentMailSettingRecord) []string {
-	changed := make([]string, 0, 5)
+	changed := make([]string, 0, 10)
 	if before.Enabled != after.Enabled {
 		changed = append(changed, "enabled")
+	}
+	if before.Provider != after.Provider {
+		changed = append(changed, "provider")
 	}
 	if before.SMTPUsername != after.SMTPUsername {
 		changed = append(changed, "smtp_username")
@@ -298,6 +442,18 @@ func documentMailChangedFields(before authrepo.DocumentMailSettingRecord, after 
 	}
 	if before.SenderName != after.SenderName {
 		changed = append(changed, "sender_name")
+	}
+	if before.SMTPForgeBaseURL != after.SMTPForgeBaseURL {
+		changed = append(changed, "smtp_forge_base_url")
+	}
+	if before.SMTPForgeAPIKeyEncrypted != after.SMTPForgeAPIKeyEncrypted {
+		changed = append(changed, "smtp_forge_api_key")
+	}
+	if before.SMTPForgeAccountID != after.SMTPForgeAccountID {
+		changed = append(changed, "smtp_forge_account_id")
+	}
+	if before.SMTPForgeFromEmail != after.SMTPForgeFromEmail {
+		changed = append(changed, "smtp_forge_from_email")
 	}
 	return changed
 }
@@ -345,21 +501,15 @@ func (s *DocumentMailService) notifyAdmins(ctx context.Context, actorID string, 
 	}
 }
 
-// credentials loads the tenant settings and decrypts the app password.
-func (s *DocumentMailService) credentials(ctx context.Context) (mail.Credentials, error) {
-	setting, err := s.repo.GetDocumentMailRecord(ctx)
-	if err != nil {
-		return mail.Credentials{}, err
-	}
-	if !s.isReady(setting) {
-		return mail.Credentials{}, ErrDocumentMailNotReady
-	}
-
+func (s *DocumentMailService) gmailCredentials(setting authrepo.DocumentMailSettingRecord, overridePassword *string) (mail.Credentials, error) {
 	password := ""
-	if setting.HasPassword() {
+	if overridePassword != nil && strings.TrimSpace(*overridePassword) != "" {
+		password = strings.Join(strings.Fields(*overridePassword), "")
+	} else if setting.HasPassword() {
 		if s.encrypter == nil {
 			return mail.Credentials{}, errors.New("document mail encrypter is not configured")
 		}
+		var err error
 		password, err = s.encrypter.DecryptString(setting.SMTPPasswordEncrypted)
 		if err != nil {
 			return mail.Credentials{}, fmt.Errorf("decrypt document mail password: %w", err)
@@ -370,6 +520,30 @@ func (s *DocumentMailService) credentials(ctx context.Context) (mail.Credentials
 		Username:   setting.SMTPUsername,
 		Password:   password,
 		Port:       setting.SMTPPort,
+		SenderName: setting.SenderName,
+	}, nil
+}
+
+func (s *DocumentMailService) forgeCredentials(setting authrepo.DocumentMailSettingRecord, overrideAPIKey *string) (mail.SMTPForgeCredentials, error) {
+	apiKey := ""
+	if overrideAPIKey != nil && strings.TrimSpace(*overrideAPIKey) != "" {
+		apiKey = strings.TrimSpace(*overrideAPIKey)
+	} else if setting.HasSMTPForgeAPIKey() {
+		if s.encrypter == nil {
+			return mail.SMTPForgeCredentials{}, errors.New("document mail encrypter is not configured")
+		}
+		var err error
+		apiKey, err = s.encrypter.DecryptString(setting.SMTPForgeAPIKeyEncrypted)
+		if err != nil {
+			return mail.SMTPForgeCredentials{}, fmt.Errorf("decrypt smtp forge api key: %w", err)
+		}
+	}
+
+	return mail.SMTPForgeCredentials{
+		BaseURL:    setting.SMTPForgeBaseURL,
+		APIKey:     apiKey,
+		AccountID:  setting.SMTPForgeAccountID,
+		FromEmail:  setting.SMTPForgeFromEmail,
 		SenderName: setting.SenderName,
 	}, nil
 }
@@ -527,15 +701,41 @@ func (s *DocumentMailService) startQueued(ctx context.Context, id string, req Do
 }
 
 // Deliver sends one document email synchronously (20 s budget) and records
-// the attempt. When the SMTP send fails, the returned delivery is the failed
+// the attempt. When the send fails, the returned delivery is the failed
 // row and the error is a *mail.SendError carrying the fixed category.
 // ErrDocumentMailNotReady / ErrDocumentMailInFlight / ErrDocumentMailInvalidRequest
 // mean nothing was sent and (for the first two) no row was written.
 func (s *DocumentMailService) Deliver(ctx context.Context, req DocumentMailRequest) (model.EmailDelivery, error) {
+	setting, err := s.repo.GetDocumentMailRecord(ctx)
+	if err != nil {
+		return model.EmailDelivery{}, err
+	}
+	if !s.isReady(setting) {
+		return model.EmailDelivery{}, ErrDocumentMailNotReady
+	}
+	return s.deliverWithSetting(ctx, setting, nil, nil, req)
+}
+
+func (s *DocumentMailService) deliverWithSetting(
+	ctx context.Context,
+	setting authrepo.DocumentMailSettingRecord,
+	overridePassword *string,
+	overrideAPIKey *string,
+	req DocumentMailRequest,
+) (model.EmailDelivery, error) {
 	if err := validateDocumentMailRequest(req); err != nil {
 		return model.EmailDelivery{}, err
 	}
-	creds, err := s.credentials(ctx)
+
+	normalized := authrepo.NormalizeDocumentMailSettingRecord(setting)
+	var gmailCreds mail.Credentials
+	var forgeCreds mail.SMTPForgeCredentials
+	var err error
+	if normalized.Provider == authrepo.DocumentMailProviderSMTPForge {
+		forgeCreds, err = s.forgeCredentials(normalized, overrideAPIKey)
+	} else {
+		gmailCreds, err = s.gmailCredentials(normalized, overridePassword)
+	}
 	if err != nil {
 		return model.EmailDelivery{}, err
 	}
@@ -572,34 +772,16 @@ func (s *DocumentMailService) Deliver(ctx context.Context, req DocumentMailReque
 		Attachments: req.Attachments,
 	}
 
+	if normalized.Provider == authrepo.DocumentMailProviderSMTPForge {
+		return s.deliverViaForge(ctx, delivery, forgeCreds, message, req.Kind)
+	}
+
 	sendCtx, cancel := context.WithTimeout(ctx, documentMailSendTimeout)
-	sendErr := s.transport.Send(sendCtx, creds, message)
+	sendErr := s.transport.Send(sendCtx, gmailCreds, message)
 	cancel()
 
 	if sendErr != nil {
-		category, code, text := "unknown", 0, "Pengiriman email gagal"
-		if classified, ok := mail.AsSendError(sendErr); ok {
-			category, code, text = string(classified.Category), classified.Code, classified.Message()
-		}
-		cause := ""
-		if unwrapped := errors.Unwrap(sendErr); unwrapped != nil {
-			cause = unwrapped.Error()
-		}
-		slog.WarnContext(ctx, "document mail send failed",
-			"delivery_id", delivery.ID,
-			"kind", req.Kind,
-			"category", category,
-			"smtp_code", code,
-			"cause", cause,
-		)
-		failed, markErr := s.deliveries.MarkFailed(ctx, delivery.ID, text)
-		if markErr != nil {
-			slog.ErrorContext(ctx, "document mail: recording failed delivery failed", "delivery_id", delivery.ID, "error", markErr)
-			delivery.Status = model.EmailDeliveryStatusFailed
-			delivery.Error = &text
-			return delivery, sendErr
-		}
-		return failed, sendErr
+		return s.recordDeliveryFailure(ctx, delivery, req.Kind, sendErr)
 	}
 
 	sent, err := s.deliveries.MarkSent(ctx, delivery.ID, s.now())
@@ -612,9 +794,271 @@ func (s *DocumentMailService) Deliver(ctx context.Context, req DocumentMailReque
 	return sent, nil
 }
 
+func (s *DocumentMailService) deliverViaForge(
+	ctx context.Context,
+	delivery model.EmailDelivery,
+	creds mail.SMTPForgeCredentials,
+	message mail.Message,
+	kind string,
+) (model.EmailDelivery, error) {
+	if s.forge == nil {
+		s.forge = mail.NewSMTPForgeSender(nil)
+	}
+
+	forgeAttachments, tempKeys, err := s.uploadForgeAttachments(ctx, delivery.ID, message.Attachments)
+	if err != nil {
+		return s.recordDeliveryFailure(ctx, delivery, kind, err)
+	}
+
+	sendCtx, cancel := context.WithTimeout(ctx, documentMailSendTimeout)
+	jobID, sendErr := s.forge.Send(sendCtx, creds, message, forgeAttachments)
+	cancel()
+
+	if sendErr != nil {
+		s.cleanupTempS3Keys(ctx, tempKeys)
+		return s.recordDeliveryFailure(ctx, delivery, kind, sendErr)
+	}
+
+	if updated, err := s.deliveries.SetExternalJobID(ctx, delivery.ID, jobID); err == nil {
+		delivery = updated
+	} else {
+		delivery.ExternalJobID = &jobID
+	}
+
+	s.forgeSessions.Store(delivery.ID, forgeTestSession{
+		baseURL: creds.BaseURL,
+		apiKey:  creds.APIKey,
+		jobID:   jobID,
+	})
+
+	detached := platformmiddleware.DetachTenantContext(ctx)
+	go s.monitorForgeJob(detached, delivery.ID, creds.BaseURL, creds.APIKey, jobID, tempKeys)
+	return delivery, nil
+}
+
+func (s *DocumentMailService) uploadForgeAttachments(
+	ctx context.Context,
+	deliveryID string,
+	attachments []mail.Attachment,
+) ([]mail.SMTPForgeAttachment, []string, error) {
+	if len(attachments) == 0 {
+		return nil, nil, nil
+	}
+	presigner, ok := s.storage.(presignStorage)
+	if !ok || s.storage == nil {
+		return nil, nil, &mail.SendError{
+			Category: mail.CategoryConfig,
+			Detail:   "SMTP Forge membutuhkan STORAGE_DRIVER=s3 untuk mengirim lampiran",
+		}
+	}
+
+	result := make([]mail.SMTPForgeAttachment, 0, len(attachments))
+	keys := make([]string, 0, len(attachments))
+	for idx, att := range attachments {
+		name := filepath.Base(strings.TrimSpace(att.Filename))
+		if name == "" || name == "." {
+			name = fmt.Sprintf("attachment-%d.bin", idx+1)
+		}
+		key := fmt.Sprintf("tmp/document-mail/%s/%d-%s", deliveryID, idx, name)
+		contentType := strings.TrimSpace(att.ContentType)
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
+		if err := presigner.Put(ctx, key, bytes.NewReader(att.Data), int64(len(att.Data)), contentType); err != nil {
+			s.cleanupTempS3Keys(ctx, keys)
+			return nil, nil, mail.NewSendError(mail.CategoryConnect, 0, "s3", "", err)
+		}
+		keys = append(keys, key)
+
+		signedURL, err := presigner.PresignGet(ctx, key, 15*time.Minute)
+		if err != nil {
+			s.cleanupTempS3Keys(ctx, keys)
+			return nil, nil, mail.NewSendError(mail.CategoryConfig, 0, "", "gagal membuat URL sementara S3", err)
+		}
+		result = append(result, mail.SMTPForgeAttachment{
+			Filename: name,
+			URL:      signedURL,
+		})
+	}
+	return result, keys, nil
+}
+
+func (s *DocumentMailService) cleanupTempS3Keys(ctx context.Context, keys []string) {
+	if s.storage == nil || len(keys) == 0 {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	for _, key := range keys {
+		if err := s.storage.Delete(cleanupCtx, key); err != nil {
+			slog.WarnContext(cleanupCtx, "document mail: failed to cleanup temp s3 attachment", "key", key, "error", err)
+		}
+	}
+}
+
+func (s *DocumentMailService) monitorForgeJob(
+	parentCtx context.Context,
+	deliveryID string,
+	baseURL string,
+	apiKey string,
+	jobID string,
+	tempKeys []string,
+) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.ErrorContext(parentCtx, "document mail: monitorForgeJob panicked", "delivery_id", deliveryID, "panic", r)
+		}
+	}()
+	defer s.cleanupTempS3Keys(parentCtx, tempKeys)
+
+	ctx, cancel := context.WithTimeout(parentCtx, 3*time.Minute)
+	defer cancel()
+
+	resp, err := s.forge.OpenProgressStream(ctx, baseURL, apiKey, jobID)
+	if err != nil {
+		slog.WarnContext(ctx, "document mail: open smtp forge progress stream failed", "delivery_id", deliveryID, "job_id", jobID, "error", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		slog.WarnContext(ctx, "document mail: smtp forge progress stream returned non-2xx", "delivery_id", deliveryID, "status", resp.StatusCode)
+		return
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 16*1024), 256*1024)
+	currentEvent := ""
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "event:") {
+			currentEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			if currentEvent == "completed" {
+				if _, markErr := platformmiddleware.WithScopedTenantConn(ctx, func(scoped context.Context) (struct{}, error) {
+					_, err := s.deliveries.MarkSent(scoped, deliveryID, s.now())
+					return struct{}{}, err
+				}); markErr != nil {
+					slog.WarnContext(ctx, "document mail: mark sent from forge sse failed", "delivery_id", deliveryID, "error", markErr)
+				}
+				return
+			}
+			if currentEvent == "failed" {
+				if _, markErr := platformmiddleware.WithScopedTenantConn(ctx, func(scoped context.Context) (struct{}, error) {
+					_, err := s.deliveries.MarkFailed(scoped, deliveryID, "Pengiriman melalui SMTP Forge gagal")
+					return struct{}{}, err
+				}); markErr != nil {
+					slog.WarnContext(ctx, "document mail: mark failed from forge sse failed", "delivery_id", deliveryID, "error", markErr)
+				}
+				return
+			}
+		}
+	}
+}
+
+func (s *DocumentMailService) recordDeliveryFailure(ctx context.Context, delivery model.EmailDelivery, kind string, sendErr error) (model.EmailDelivery, error) {
+	category, code, text := "unknown", 0, "Pengiriman email gagal"
+	if classified, ok := mail.AsSendError(sendErr); ok {
+		category, code, text = string(classified.Category), classified.Code, classified.Message()
+	}
+	cause := ""
+	if unwrapped := errors.Unwrap(sendErr); unwrapped != nil {
+		cause = unwrapped.Error()
+	}
+	slog.WarnContext(ctx, "document mail send failed",
+		"delivery_id", delivery.ID,
+		"kind", kind,
+		"category", category,
+		"smtp_code", code,
+		"cause", cause,
+	)
+	failed, markErr := s.deliveries.MarkFailed(ctx, delivery.ID, text)
+	if markErr != nil {
+		slog.ErrorContext(ctx, "document mail: recording failed delivery failed", "delivery_id", delivery.ID, "error", markErr)
+		delivery.Status = model.EmailDeliveryStatusFailed
+		delivery.Error = &text
+		return delivery, sendErr
+	}
+	return failed, sendErr
+}
+
+// StreamDeliveryProgress proxies SMTP Forge's SSE progress stream for a
+// delivery ID without exposing the API key to the browser.
+func (s *DocumentMailService) StreamDeliveryProgress(ctx context.Context, deliveryID string, w http.ResponseWriter, flusher http.Flusher) error {
+	var baseURL, apiKey, jobID string
+	if raw, ok := s.forgeSessions.Load(deliveryID); ok {
+		sess := raw.(forgeTestSession)
+		baseURL, apiKey, jobID = sess.baseURL, sess.apiKey, sess.jobID
+	} else {
+		delivery, err := s.deliveries.GetByID(ctx, deliveryID)
+		if errors.Is(err, notificationsrepo.ErrEmailDeliveryNotFound) {
+			return ErrDocumentMailDeliveryNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if delivery.ExternalJobID == nil || strings.TrimSpace(*delivery.ExternalJobID) == "" {
+			return ErrDocumentMailDeliveryNotFound
+		}
+		setting, err := s.repo.GetDocumentMailRecord(ctx)
+		if err != nil {
+			return err
+		}
+		creds, err := s.forgeCredentials(setting, nil)
+		if err != nil {
+			return err
+		}
+		baseURL, apiKey, jobID = creds.BaseURL, creds.APIKey, *delivery.ExternalJobID
+	}
+
+	if s.forge == nil {
+		s.forge = mail.NewSMTPForgeSender(nil)
+	}
+	resp, err := s.forge.OpenProgressStream(ctx, baseURL, apiKey, jobID)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("smtp forge progress returned HTTP %d", resp.StatusCode)
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	flusher.Flush()
+
+	buf := make([]byte, 4096)
+	for {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				return nil
+			}
+			flusher.Flush()
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			return readErr
+		}
+	}
+}
+
 // SendTest emails the caller's own login address through the configured
 // account and records a kind='test' delivery.
 func (s *DocumentMailService) SendTest(ctx context.Context, actorID string) (dto.DocumentMailTestResponse, error) {
+	return s.SendTestWithOverride(ctx, actorID, nil)
+}
+
+// SendTestWithOverride emails the caller's own login address using either
+// unsaved form values (when override != nil) or the saved tenant setting.
+func (s *DocumentMailService) SendTestWithOverride(ctx context.Context, actorID string, override *dto.TestDocumentMailRequest) (dto.DocumentMailTestResponse, error) {
 	user, err := s.repo.GetUserByID(ctx, actorID)
 	if err != nil {
 		return dto.DocumentMailTestResponse{}, err
@@ -623,19 +1067,76 @@ func (s *DocumentMailService) SendTest(ctx context.Context, actorID string) (dto
 	if err != nil {
 		return dto.DocumentMailTestResponse{}, err
 	}
-	if !s.isReady(setting) {
+
+	var overridePassword *string
+	var overrideAPIKey *string
+	if override != nil {
+		setting.Enabled = true
+		if strings.TrimSpace(override.Provider) != "" {
+			setting.Provider = strings.ToLower(strings.TrimSpace(override.Provider))
+		}
+		if strings.TrimSpace(override.SenderName) != "" || override.Provider != "" {
+			setting.SenderName = sanitizeSenderName(override.SenderName)
+		}
+		if setting.Provider == authrepo.DocumentMailProviderSMTPForge {
+			setting.SMTPForgeBaseURL = strings.TrimRight(strings.TrimSpace(override.SMTPForgeBaseURL), "/")
+			setting.SMTPForgeAccountID = strings.TrimSpace(override.SMTPForgeAccountID)
+			setting.SMTPForgeFromEmail = strings.ToLower(strings.TrimSpace(override.SMTPForgeFromEmail))
+			overrideAPIKey = override.SMTPForgeAPIKey
+		} else {
+			if strings.TrimSpace(override.SMTPUsername) != "" {
+				setting.SMTPUsername = strings.ToLower(strings.TrimSpace(override.SMTPUsername))
+			}
+			if override.SMTPPort == 587 || override.SMTPPort == 465 {
+				setting.SMTPPort = override.SMTPPort
+			}
+			overridePassword = override.SMTPPassword
+		}
+		setting = authrepo.NormalizeDocumentMailSettingRecord(setting)
+	}
+
+	hasSecret := func() bool {
+		if setting.Provider == authrepo.DocumentMailProviderSMTPForge {
+			return (overrideAPIKey != nil && strings.TrimSpace(*overrideAPIKey) != "") || setting.HasSMTPForgeAPIKey()
+		}
+		return (overridePassword != nil && strings.TrimSpace(*overridePassword) != "") || setting.HasPassword() || s.effectiveDevSMTPAddr(setting) != ""
+	}()
+
+	if override == nil && !s.isReady(setting) {
 		return dto.DocumentMailTestResponse{}, ErrDocumentMailNotReady
+	}
+	if override != nil {
+		if !hasSecret {
+			return dto.DocumentMailTestResponse{}, ErrDocumentMailNotReady
+		}
+		if setting.Provider == authrepo.DocumentMailProviderSMTPForge {
+			if _, err := mail.NormalizeSMTPForgeAPIBase(setting.SMTPForgeBaseURL); err != nil {
+				return dto.DocumentMailTestResponse{}, ErrDocumentMailNotReady
+			}
+		} else if setting.SMTPUsername == "" || mail.ValidateAddress(setting.SMTPUsername) != nil {
+			return dto.DocumentMailTestResponse{}, ErrDocumentMailNotReady
+		}
+	}
+
+	providerLabel := "Gmail"
+	accountDesc := setting.SMTPUsername
+	if setting.Provider == authrepo.DocumentMailProviderSMTPForge {
+		providerLabel = "SMTP Forge"
+		accountDesc = setting.SMTPForgeFromEmail
+		if accountDesc == "" {
+			accountDesc = setting.SMTPForgeBaseURL
+		}
 	}
 
 	text, html, err := mail.RenderDocumentEmail(mail.DocumentEmail{
 		RecipientName: user.FullName,
 		ParagraphsID: []string{
-			"Ini adalah email uji dari pengaturan Email Dokumen (Gmail) di KANTOR.",
-			fmt.Sprintf("Jika email ini sampai, slip gaji dan kontrak kerja dapat dikirim melalui akun %s. Email ini tidak perlu dibalas.", setting.SMTPUsername),
+			fmt.Sprintf("Ini adalah email uji dari pengaturan Email Dokumen (%s) di KANTOR.", providerLabel),
+			fmt.Sprintf("Jika email ini sampai, slip gaji dan kontrak kerja dapat dikirim melalui %s (%s). Email ini tidak perlu dibalas.", providerLabel, accountDesc),
 		},
 		ParagraphsEN: []string{
-			"This is a test email from the Document Email (Gmail) settings in KANTOR.",
-			fmt.Sprintf("If it reached you, payslips and employment contracts can be sent through the %s account. No reply is needed.", setting.SMTPUsername),
+			fmt.Sprintf("This is a test email from the Document Email (%s) settings in KANTOR.", providerLabel),
+			fmt.Sprintf("If it reached you, payslips and employment contracts can be sent through %s (%s). No reply is needed.", providerLabel, accountDesc),
 		},
 		Signature: setting.SenderName,
 	})
@@ -643,7 +1144,7 @@ func (s *DocumentMailService) SendTest(ctx context.Context, actorID string) (dto
 		return dto.DocumentMailTestResponse{}, err
 	}
 
-	delivery, err := s.Deliver(ctx, DocumentMailRequest{
+	delivery, err := s.deliverWithSetting(ctx, setting, overridePassword, overrideAPIKey, DocumentMailRequest{
 		Kind:            model.EmailDeliveryKindTest,
 		Recipient:       user.Email,
 		RecipientSource: model.EmailRecipientSourceSelf,
@@ -654,9 +1155,10 @@ func (s *DocumentMailService) SendTest(ctx context.Context, actorID string) (dto
 	})
 
 	result := dto.DocumentMailTestResponse{
-		Sent:       err == nil,
-		DeliveryID: delivery.ID,
-		Recipient:  strings.ToLower(strings.TrimSpace(user.Email)),
+		Sent:          err == nil,
+		DeliveryID:    delivery.ID,
+		ExternalJobID: delivery.ExternalJobID,
+		Recipient:     strings.ToLower(strings.TrimSpace(user.Email)),
 	}
 	if err != nil {
 		sendErr, ok := mail.AsSendError(err)

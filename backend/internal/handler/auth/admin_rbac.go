@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 
@@ -415,7 +416,28 @@ func (h *Handler) SendDocumentMailTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := h.documentMail.SendTest(r.Context(), principal.UserID)
+	var override *dto.TestDocumentMailRequest
+	if r.Body != nil {
+		var body dto.TestDocumentMailRequest
+		err := json.NewDecoder(r.Body).Decode(&body)
+		if err != nil && !errors.Is(err, io.EOF) {
+			response.WriteError(w, http.StatusBadRequest, "INVALID_JSON", "Request body must be valid JSON", nil)
+			return
+		}
+		if err == nil {
+			if body.Provider != "" || body.SMTPUsername != "" || body.SMTPPassword != nil ||
+				body.SMTPForgeBaseURL != "" || body.SMTPForgeAPIKey != nil ||
+				body.SMTPForgeAccountID != "" || body.SMTPForgeFromEmail != "" || body.SenderName != "" {
+				if err := h.validator.Struct(body); err != nil {
+					response.WriteError(w, http.StatusBadRequest, "VALIDATION_ERROR", "Request validation failed", validationDetails(err))
+					return
+				}
+				override = &body
+			}
+		}
+	}
+
+	result, err := h.documentMail.SendTestWithOverride(r.Context(), principal.UserID, override)
 	if err != nil {
 		h.writeDocumentMailError(r.Context(), w, err, "Failed to send test email")
 		return
@@ -431,6 +453,29 @@ func (h *Handler) SendDocumentMailTest(w http.ResponseWriter, r *http.Request) {
 	}
 	platformmiddleware.AuditLog(r.Context(), "send_test", "admin", "system_setting", "document_mail", nil, auditValue)
 	response.WriteJSON(w, http.StatusOK, result, nil)
+}
+
+func (h *Handler) StreamDocumentMailProgress(w http.ResponseWriter, r *http.Request) {
+	if !h.requireDocumentMail(w) {
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		response.WriteError(w, http.StatusInternalServerError, "STREAM_UNSUPPORTED", "Streaming is not supported", nil)
+		return
+	}
+	deliveryID := strings.TrimSpace(chi.URLParam(r, "deliveryID"))
+	if deliveryID == "" {
+		response.WriteError(w, http.StatusBadRequest, "VALIDATION_ERROR", "deliveryID is required", nil)
+		return
+	}
+	if err := h.documentMail.StreamDeliveryProgress(r.Context(), deliveryID, w, flusher); err != nil {
+		if errors.Is(err, authservice.ErrDocumentMailDeliveryNotFound) {
+			response.WriteError(w, http.StatusNotFound, "NOT_FOUND", err.Error(), nil)
+			return
+		}
+		response.WriteInternalError(r.Context(), w, err, "Failed to stream email delivery progress")
+	}
 }
 
 func (h *Handler) requireDocumentMail(w http.ResponseWriter) bool {
@@ -449,6 +494,16 @@ func (h *Handler) writeDocumentMailError(ctx context.Context, w http.ResponseWri
 		response.WriteError(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), map[string]string{"smtp_username": "email"})
 	case errors.Is(err, authservice.ErrDocumentMailPasswordRequired):
 		response.WriteError(w, http.StatusBadRequest, "SMTP_PASSWORD_REQUIRED", err.Error(), map[string]string{"smtp_password": "required"})
+	case errors.Is(err, authservice.ErrDocumentMailForgeURLRequired):
+		response.WriteError(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), map[string]string{"smtp_forge_base_url": "required"})
+	case errors.Is(err, authservice.ErrDocumentMailForgeURLInvalid):
+		response.WriteError(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), map[string]string{"smtp_forge_base_url": "url"})
+	case errors.Is(err, authservice.ErrDocumentMailForgeAPIKeyRequired):
+		response.WriteError(w, http.StatusBadRequest, "SMTP_FORGE_API_KEY_REQUIRED", err.Error(), map[string]string{"smtp_forge_api_key": "required"})
+	case errors.Is(err, authservice.ErrDocumentMailForgeAccountInvalid):
+		response.WriteError(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), map[string]string{"smtp_forge_account_id": "uuid"})
+	case errors.Is(err, authservice.ErrDocumentMailForgeFromEmailInvalid):
+		response.WriteError(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error(), map[string]string{"smtp_forge_from_email": "email"})
 	case errors.Is(err, authservice.ErrDocumentMailNotReady):
 		response.WriteError(w, http.StatusConflict, "DOCUMENT_MAIL_NOT_READY", err.Error(), nil)
 	case errors.Is(err, authservice.ErrDocumentMailInFlight):

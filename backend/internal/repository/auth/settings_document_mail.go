@@ -13,21 +13,28 @@ import (
 
 const (
 	documentMailSettingKey         = "document_mail"
-	documentMailSettingDescription = "Konfigurasi Gmail untuk pengiriman dokumen (slip gaji, kontrak)"
+	documentMailSettingDescription = "Konfigurasi pengiriman email dokumen (slip gaji, kontrak)"
 	// DefaultDocumentMailPort is submission with STARTTLS.
 	DefaultDocumentMailPort = 587
+
+	DocumentMailProviderGmail     = "gmail"
+	DocumentMailProviderSMTPForge = "smtp_forge"
 )
 
 // DocumentMailSettingRecord is the stored system_settings value for the
-// documents-only Gmail path. The host is not stored: it is the constant
-// smtp.gmail.com in the mail package. The app password is only ever held as
-// security.Encrypter ciphertext and is never returned by the API.
+// documents-only mail path (Gmail SMTP or SMTP Forge). Secrets are only ever
+// held as security.Encrypter ciphertext and are never returned by the API.
 type DocumentMailSettingRecord struct {
-	Enabled               bool   `json:"enabled"`
-	SMTPUsername          string `json:"smtp_username"`
-	SMTPPasswordEncrypted string `json:"smtp_password_encrypted,omitempty"`
-	SMTPPort              int    `json:"smtp_port"`
-	SenderName            string `json:"sender_name"`
+	Enabled                  bool   `json:"enabled"`
+	Provider                 string `json:"provider"`
+	SMTPUsername             string `json:"smtp_username"`
+	SMTPPasswordEncrypted    string `json:"smtp_password_encrypted,omitempty"`
+	SMTPPort                 int    `json:"smtp_port"`
+	SenderName               string `json:"sender_name"`
+	SMTPForgeBaseURL         string `json:"smtp_forge_base_url,omitempty"`
+	SMTPForgeAPIKeyEncrypted string `json:"smtp_forge_api_key_encrypted,omitempty"`
+	SMTPForgeAccountID       string `json:"smtp_forge_account_id,omitempty"`
+	SMTPForgeFromEmail       string `json:"smtp_forge_from_email,omitempty"`
 }
 
 // HasPassword reports whether an encrypted app password is stored.
@@ -35,15 +42,33 @@ func (setting DocumentMailSettingRecord) HasPassword() bool {
 	return strings.TrimSpace(setting.SMTPPasswordEncrypted) != ""
 }
 
+// HasSMTPForgeAPIKey reports whether an encrypted SMTP Forge API key is stored.
+func (setting DocumentMailSettingRecord) HasSMTPForgeAPIKey() bool {
+	return strings.TrimSpace(setting.SMTPForgeAPIKeyEncrypted) != ""
+}
+
 func defaultDocumentMailSettingRecord() DocumentMailSettingRecord {
-	return DocumentMailSettingRecord{SMTPPort: DefaultDocumentMailPort}
+	return DocumentMailSettingRecord{
+		Provider: DocumentMailProviderGmail,
+		SMTPPort: DefaultDocumentMailPort,
+	}
 }
 
 func NormalizeDocumentMailSettingRecord(setting DocumentMailSettingRecord) DocumentMailSettingRecord {
 	normalized := setting
+	switch strings.ToLower(strings.TrimSpace(normalized.Provider)) {
+	case DocumentMailProviderSMTPForge:
+		normalized.Provider = DocumentMailProviderSMTPForge
+	default:
+		normalized.Provider = DocumentMailProviderGmail
+	}
 	normalized.SMTPUsername = strings.ToLower(strings.TrimSpace(normalized.SMTPUsername))
 	normalized.SMTPPasswordEncrypted = strings.TrimSpace(normalized.SMTPPasswordEncrypted)
 	normalized.SenderName = strings.TrimSpace(normalized.SenderName)
+	normalized.SMTPForgeBaseURL = strings.TrimRight(strings.TrimSpace(normalized.SMTPForgeBaseURL), "/")
+	normalized.SMTPForgeAPIKeyEncrypted = strings.TrimSpace(normalized.SMTPForgeAPIKeyEncrypted)
+	normalized.SMTPForgeAccountID = strings.TrimSpace(normalized.SMTPForgeAccountID)
+	normalized.SMTPForgeFromEmail = strings.ToLower(strings.TrimSpace(normalized.SMTPForgeFromEmail))
 	if normalized.SMTPPort != 587 && normalized.SMTPPort != 465 {
 		normalized.SMTPPort = DefaultDocumentMailPort
 	}

@@ -19,6 +19,7 @@ import { Input } from "@/components/ui/input";
 import { useRBAC } from "@/hooks/use-rbac";
 import { permissions } from "@/lib/permissions";
 import { emailDeliveriesKeys } from "@/services/email-deliveries";
+import { streamDocumentMailProgress } from "@/services/document-mail";
 import { contractsKeys, getContractRecipient, sendContract } from "@/services/hris-contracts";
 import { toast } from "@/stores/toast-store";
 import type { ContractDetail, ContractRecipientChoice } from "@/types/contracts";
@@ -164,8 +165,28 @@ export function SendContractDialog({
         queryClient.invalidateQueries({ queryKey: [...contractsKeys.all, "recipient", contract.id] }),
       ]);
       if (result.sent) {
-        toast.success(`Kontrak ${contract.doc_number ?? ""} terkirim`, `Ke ${result.delivery.recipient}`);
-        onClose();
+        if (result.delivery.external_job_id) {
+          toast.info(`Kontrak ${contract.doc_number ?? ""} masuk antrean`, `Mengirim ke ${result.delivery.recipient} via SMTP Forge...`);
+          onClose();
+          const controller = new AbortController();
+          void streamDocumentMailProgress(
+            `/hris/email-deliveries/${result.delivery.id}/progress`,
+            (ev) => {
+              if (ev.event === "completed") {
+                toast.success(`Kontrak ${contract.doc_number ?? ""} terkirim`, `Ke ${result.delivery.recipient}`);
+                void queryClient.invalidateQueries({ queryKey: emailDeliveriesKeys.all });
+                void queryClient.invalidateQueries({ queryKey: contractsKeys.detail(contract.id) });
+              } else if (ev.event === "failed") {
+                toast.error("Email gagal dikirim", ev.error || ev.message || undefined);
+                void queryClient.invalidateQueries({ queryKey: emailDeliveriesKeys.all });
+              }
+            },
+            controller.signal,
+          ).catch(() => {});
+        } else {
+          toast.success(`Kontrak ${contract.doc_number ?? ""} terkirim`, `Ke ${result.delivery.recipient}`);
+          onClose();
+        }
       } else {
         toast.error("Email gagal dikirim", result.error_message ?? result.delivery.error ?? undefined);
       }

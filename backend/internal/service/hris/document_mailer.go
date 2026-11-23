@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -50,7 +51,7 @@ const (
 )
 
 var (
-	ErrDocumentMailNotReady          = errors.New("Email Dokumen belum aktif atau belum lengkap. Minta Admin mengaktifkan dan mengisi akun Gmail di Admin > Settings > Email Dokumen.")
+	ErrDocumentMailNotReady          = errors.New("Email Dokumen belum aktif atau belum lengkap. Minta Admin mengaktifkan dan melengkapi pengaturan di Admin > Settings > Email Dokumen.")
 	ErrDocumentSendInFlight          = errors.New("pengiriman dokumen ini masih berjalan; tunggu hingga selesai")
 	ErrDocumentPDFConverterMissing   = errors.New(DocumentRenderFailedUnavailable)
 	ErrDocumentRecipientUnavailable  = errors.New("alamat email penerima tidak tersedia untuk sumber yang dipilih")
@@ -73,6 +74,13 @@ type documentMailSender interface {
 	GetSettings(ctx context.Context) (dto.DocumentMailSettingResponse, error)
 	Deliver(ctx context.Context, req authservice.DocumentMailRequest) (model.EmailDelivery, error)
 	Enqueue(ctx context.Context, req authservice.DocumentMailRequest) (model.EmailDelivery, error)
+	StreamDeliveryProgress(ctx context.Context, deliveryID string, w http.ResponseWriter, flusher http.Flusher) error
+}
+
+// StreamDeliveryProgress proxies SMTP Forge's SSE progress stream for a
+// document email delivery.
+func (m *DocumentMailer) StreamDeliveryProgress(ctx context.Context, deliveryID string, w http.ResponseWriter, flusher http.Flusher) error {
+	return m.sender.StreamDeliveryProgress(ctx, deliveryID, w, flusher)
 }
 
 type documentMailerDeliveries interface {

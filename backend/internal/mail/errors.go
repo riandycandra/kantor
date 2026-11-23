@@ -136,6 +136,17 @@ func configError(detail string) *SendError {
 	return &SendError{Category: CategoryConfig, Detail: detail}
 }
 
+// NewSendError constructs a SendError with an underlying cause for server-side logging.
+func NewSendError(category ErrorCategory, code int, addr string, detail string, cause error) *SendError {
+	return &SendError{
+		Category: category,
+		Code:     code,
+		Addr:     addr,
+		Detail:   detail,
+		cause:    cause,
+	}
+}
+
 // classify maps a raw error from a given stage to a SendError.
 func classify(st stage, addr string, err error) *SendError {
 	if err == nil {

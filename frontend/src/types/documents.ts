@@ -247,6 +247,7 @@ export interface EmailDelivery {
   error?: string;
   attempts: number;
   batch_id?: string;
+  external_job_id?: string | null;
   requested_by?: string;
   created_at: string;
   updated_at: string;

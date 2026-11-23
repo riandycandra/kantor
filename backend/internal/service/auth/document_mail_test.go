@@ -128,6 +128,20 @@ func (f *fakeDeliveries) MarkSending(ctx context.Context, id string) (model.Emai
 	return *row, nil
 }
 
+func (f *fakeDeliveries) SetExternalJobID(ctx context.Context, id string, externalJobID string) (model.EmailDelivery, error) {
+	if err := ctx.Err(); err != nil {
+		return model.EmailDelivery{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row, ok := f.rows[id]
+	if !ok {
+		return model.EmailDelivery{}, notificationsrepo.ErrEmailDeliveryNotFound
+	}
+	row.ExternalJobID = &externalJobID
+	return *row, nil
+}
+
 func (f *fakeDeliveries) MarkSent(ctx context.Context, id string, sentAt time.Time) (model.EmailDelivery, error) {
 	if err := ctx.Err(); err != nil {
 		return model.EmailDelivery{}, err
@@ -791,5 +805,36 @@ func TestDocumentMailSendTestDevCaptureUnreachable(t *testing.T) {
 		if strings.Contains(*row.Error, secret) {
 			t.Fatalf("error leaks %q", secret)
 		}
+	}
+}
+
+func TestDocumentMailSMTPForgeBypassesMailpitAndTestsUnsaved(t *testing.T) {
+	f := newDocumentMailFixture(t)
+	f.transport.devAddr = "localhost:1025"
+
+	apiKey := "forge-test-key"
+	updated, _, err := f.service.UpdateSettings(context.Background(), "admin-1", dto.UpdateDocumentMailRequest{
+		Enabled:            true,
+		Provider:           authrepo.DocumentMailProviderSMTPForge,
+		SMTPForgeBaseURL:   "https://mailer.example.com/",
+		SMTPForgeAPIKey:    &apiKey,
+		SMTPForgeAccountID: "b2fe839c-0f7f-48fe-872f-9dc37d51af65",
+		SMTPForgeFromEmail: "hr@example.com",
+		SenderName:         "HR Kantor",
+	})
+	if err != nil {
+		t.Fatalf("UpdateSettings: %v", err)
+	}
+	if updated.Provider != authrepo.DocumentMailProviderSMTPForge {
+		t.Fatalf("expected provider smtp_forge, got %q", updated.Provider)
+	}
+	if updated.Delivery.Mode != DocumentMailModeSMTPForge {
+		t.Fatalf("expected delivery mode smtp_forge (bypassing Mailpit), got %+v", updated.Delivery)
+	}
+	if updated.DevSMTPAddr != nil {
+		t.Fatalf("expected DevSMTPAddr nil for smtp_forge, got %v", *updated.DevSMTPAddr)
+	}
+	if !updated.HasSMTPForgeAPIKey || !updated.Ready {
+		t.Fatalf("expected HasSMTPForgeAPIKey and Ready true, got %+v", updated)
 	}
 }

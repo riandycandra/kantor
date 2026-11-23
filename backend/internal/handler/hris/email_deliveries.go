@@ -1,12 +1,14 @@
 package hris
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/kana-consultant/kantor/backend/internal/response"
+	authservice "github.com/kana-consultant/kantor/backend/internal/service/auth"
 	hrisservice "github.com/kana-consultant/kantor/backend/internal/service/hris"
 )
 
@@ -25,6 +27,30 @@ func NewEmailDeliveriesHandler(mailer *hrisservice.DocumentMailer) *EmailDeliver
 
 func (h *EmailDeliveriesHandler) RegisterRoutes(router chi.Router) {
 	router.Get("/", h.list)
+	router.Get("/{deliveryID}/progress", h.streamProgress)
+}
+
+func (h *EmailDeliveriesHandler) streamProgress(w http.ResponseWriter, r *http.Request) {
+	if _, ok := principalOrUnauthorized(w, r); !ok {
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		response.WriteError(w, http.StatusInternalServerError, "STREAM_UNSUPPORTED", "Streaming is not supported", nil)
+		return
+	}
+	deliveryID := strings.TrimSpace(chi.URLParam(r, "deliveryID"))
+	if deliveryID == "" {
+		response.WriteError(w, http.StatusBadRequest, "VALIDATION_ERROR", "deliveryID is required", nil)
+		return
+	}
+	if err := h.mailer.StreamDeliveryProgress(r.Context(), deliveryID, w, flusher); err != nil {
+		if errors.Is(err, authservice.ErrDocumentMailDeliveryNotFound) {
+			response.WriteError(w, http.StatusNotFound, "NOT_FOUND", err.Error(), nil)
+			return
+		}
+		response.WriteInternalError(r.Context(), w, err, "Gagal memuat progres pengiriman email")
+	}
 }
 
 func (h *EmailDeliveriesHandler) list(w http.ResponseWriter, r *http.Request) {

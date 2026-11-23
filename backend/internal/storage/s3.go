@@ -7,6 +7,7 @@ import (
 	"io"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -38,9 +39,10 @@ type S3API interface {
 
 // S3Storage implements the Storage interface for S3-compatible object storage.
 type S3Storage struct {
-	client S3API
-	bucket string
-	prefix string
+	client        S3API
+	presignClient *s3.PresignClient
+	bucket        string
+	prefix        string
 }
 
 // NewS3Storage creates an S3Storage instance connected to AWS S3, Cloudflare R2, MinIO, or GCP.
@@ -85,9 +87,10 @@ func NewS3Storage(ctx context.Context, cfg S3Config) (*S3Storage, error) {
 	})
 
 	return &S3Storage{
-		client: client,
-		bucket: cfg.Bucket,
-		prefix: strings.Trim(cfg.CustomKeyPrefix, "/"),
+		client:        client,
+		presignClient: s3.NewPresignClient(client),
+		bucket:        cfg.Bucket,
+		prefix:        strings.Trim(cfg.CustomKeyPrefix, "/"),
 	}, nil
 }
 
@@ -201,6 +204,30 @@ func (s *S3Storage) Exists(ctx context.Context, key string) (bool, error) {
 		return false, fmt.Errorf("s3 head object: %w", err)
 	}
 	return true, nil
+}
+
+// PresignGet generates a time-limited presigned GET URL for the specified key.
+func (s *S3Storage) PresignGet(ctx context.Context, key string, expiry time.Duration) (string, error) {
+	if s.presignClient == nil {
+		return "", errors.New("s3 presign client is not configured")
+	}
+	resolvedKey, err := s.resolveKey(key)
+	if err != nil {
+		return "", err
+	}
+	if expiry <= 0 {
+		expiry = 15 * time.Minute
+	}
+	presigned, err := s.presignClient.PresignGetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(resolvedKey),
+	}, func(opts *s3.PresignOptions) {
+		opts.Expires = expiry
+	})
+	if err != nil {
+		return "", fmt.Errorf("s3 presign get object: %w", err)
+	}
+	return presigned.URL, nil
 }
 
 func isS3NotFound(err error) bool {
